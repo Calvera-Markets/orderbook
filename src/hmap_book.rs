@@ -79,7 +79,7 @@ impl OrderBook {
         side: Side,
         price_limit: Option<Price>,
         quantity: u64,
-    ) -> (Vec<Fill>, u64) {
+    ) -> Result<(Vec<Fill>, u64)> {
         let mut fills = Vec::new();
         let mut remaining = quantity;
 
@@ -145,14 +145,9 @@ impl OrderBook {
                     Side::Ask => self
                         .bids
                         .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
-                };
-                match removed_idx {
-                    Ok(idx) => {
-                        self.order_index.remove(&resting_id);
-                        self.slab.free(idx);
-                    }
-                    Err(_) => break, // defensive: structural inconsistency
-                }
+                }?;
+                self.order_index.remove(&resting_id);
+                self.slab.free(removed_idx);
             } else {
                 self.slab.get_mut(resting_idx).quantity -= fill_qty;
                 let level = match side {
@@ -165,7 +160,7 @@ impl OrderBook {
             }
         }
 
-        (fills, remaining)
+        Ok((fills, remaining))
     }
 
     // (1) Match against the opposite side up to `price`
@@ -181,7 +176,8 @@ impl OrderBook {
         quantity: u64,
     ) -> Result<Vec<Fill>> {
         // Limit semantics: stop matching when price no longer crosses.
-        let (fills, remaining) = self.match_against_opposite(order_id, side, Some(price), quantity);
+        let (fills, remaining) =
+            self.match_against_opposite(order_id, side, Some(price), quantity)?;
 
         if remaining > 0 {
             let new_order = Order {
@@ -282,7 +278,7 @@ impl OrderBook {
         }
 
         // Market = sweep unconditionally → price_limit = None.
-        let (fills, remaining) = self.match_against_opposite(order_id, side, None, quantity);
+        let (fills, remaining) = self.match_against_opposite(order_id, side, None, quantity)?;
         let filled_quantity = quantity - remaining;
         let cancelled = remaining > 0;
 
