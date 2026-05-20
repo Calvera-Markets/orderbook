@@ -158,12 +158,12 @@ impl OrderBook {
 
             if available < quantity {
                 // Insufficient liquidity — cancel entire order, zero fills.
-                return MarketOrderResult {
+                return Ok(MarketOrderResult {
                     fills: vec![],
                     filled_quantity: 0,
                     unfilled_qty: quantity,
                     cancelled: true,
-                };
+                });
             }
         }
 
