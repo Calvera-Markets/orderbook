@@ -130,7 +130,7 @@ impl OrderBook {
         side: Side,
         quantity: u64,
         mode: MarketOrderMode,
-    ) -> MarketOrderResult {
+    ) -> Result<MarketOrderResult> {
         // NOTE: Considering the frquency of this happenening, it
         // seems like a big price to pay to run this upfront. I think the
         // best is to actually let it fail iteratively as it tries to fill
@@ -218,25 +218,24 @@ impl OrderBook {
                 quantity: fill_qty,
             });
 
+            // (1) Updates price limit and links
+            // (2) Removes order index map
+            // (3) Removes order from slab
             if fill_qty == resting_qty {
                 // Pop the fully filled resting order
-                let removed_idx = level.pop_front(&mut self.slab).unwrap();
+                let removed_idx = match side {
+                    Side::Bid => self
+                        .asks
+                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
+                    Side::Ask => self
+                        .bids
+                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
+                }?;
+
                 self.order_index.remove(&resting_id);
                 self.slab.free(removed_idx);
-
-                // Update best price cache if level is empty
-                if level.is_empty() {
-                    match side {
-                        Side::Bid => {
-                            self.asks.levels.remove(&fill_price);
-                            self.asks.price_index.remove(&fill_price);
-                            todo!();
-                            // self.asks.update_best_price();
-                        }
-                        Side::Ask => {}
-                    }
-                }
             } else {
+                // No need to update links in this branch
                 self.slab.get_mut(resting_idx).quantity -= fill_qty;
 
                 let level = match side {
@@ -250,7 +249,15 @@ impl OrderBook {
             }
         }
 
-        todo!();
+        let filled_quantity = quantity - remaining;
+        let cancelled = remaining > 0;
+
+        Ok(MarketOrderResult {
+            fills,
+            filled_quantity,
+            unfilled_qty: remaining,
+            cancelled,
+        })
     }
 }
 
@@ -292,6 +299,35 @@ impl HalfBook {
                     self.update_best_price();
                 };
             }
+        }
+    }
+
+    /// (1) Update price level and stich slab links
+    /// (2) Remove price level if empty (-price_index)
+    /// (3) Refresh best price
+    fn pop_order_from_l2_book_and_update_slab_links(
+        &mut self,
+        price: Price,
+        slab: &mut OrderSlab,
+    ) -> Result<SlabIndex> {
+        if let Some(level) = self.levels.get_mut(&price) {
+            let removed_idx = level
+                .pop_order_from_l2_level_and_update_slab_links(slab)
+                .ok_or_else(|| anyhow!("No order to pop?"))?;
+
+            if level.is_empty() {
+                self.levels.remove(&price);
+                self.price_index.remove(&price);
+
+                // Refresh the best price if needed
+                if self.best_price == Some(price) {
+                    self.update_best_price();
+                };
+            }
+
+            Ok(removed_idx)
+        } else {
+            return Err(anyhow!("No price level found, whaaat"));
         }
     }
 
@@ -426,7 +462,10 @@ impl PriceLevel {
 
     /// Remove the front order from the queue. O(1).
     /// Returns the SlabIndex of the removed order.
-    pub fn pop_front(&mut self, slab: &mut OrderSlab) -> Option<SlabIndex> {
+    pub fn pop_order_from_l2_level_and_update_slab_links(
+        &mut self,
+        slab: &mut OrderSlab,
+    ) -> Option<SlabIndex> {
         let head_idx = self.head?;
         let next = slab.get(head_idx).next;
 
