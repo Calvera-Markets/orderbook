@@ -13,3 +13,7 @@ rand = { workspace = true }
 [[bench]]
 name = "hmap_book"
 harness = false
+
+[[example]]
+name = "profile_matching"
+path = "profiling/profile_matching.rs"
