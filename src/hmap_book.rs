@@ -490,7 +490,7 @@ impl PriceLevel {
         self.tail = Some(idx);
 
         // Register quantity and counts
-        self.quantity = slab.get(idx).quantity;
+        self.quantity += slab.get(idx).quantity;
         self.order_count += 1;
     }
 
