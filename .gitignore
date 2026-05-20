@@ -3,3 +3,7 @@
 .env
 *.pem
 *.key
+
+profiling/flamegraph/*
+profiling/logs/*
+benches/logs/*
