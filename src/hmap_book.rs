@@ -500,13 +500,16 @@ impl OrderSlab {
         let mut slots = Vec::with_capacity(capacity);
 
         for i in 0..capacity {
-            slots.push(OrderSlot::Free {
-                next_free: Some((i + 1) as u32),
-            })
+            let next_free = if i + 1 < capacity {
+                Some((i + 1) as u32)
+            } else {
+                None
+            };
+            slots.push(OrderSlot::Free { next_free })
         }
 
         Self {
-            slots: Vec::with_capacity(capacity),
+            slots,
             free_head: Some(0),
             capacity,
         }
