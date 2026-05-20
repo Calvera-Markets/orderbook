@@ -1,0 +1,472 @@
+use anyhow::{Result, anyhow};
+/// Optimizations:
+/// (1) Instead of using VECs:
+/// - A simple array can't be used because it would blow the stack
+///
+/// - mmap with MAP_HUGETLB. Instead of Vec or a static array, you allocate directly
+/// from the OS using huge pages (2MB or 1GB pages instead of 4KB). This keeps the entire
+/// slab in a small number of TLB entries, dramatically reducing TLB pressure when you're
+/// scanning lots of orders. The allocation is still heap-like (it's a pointer), but the memory
+/// is physically contiguous and huge-page-backed:
+/// rust// pseudocode — real impl `uses libc::mmap`
+/// ```rust
+/// let ptr = mmap(size, MAP_ANONYMOUS | MAP_HUGETLB);
+/// let slab: &mut [OrderSlot] = slice::from_raw_parts_mut(ptr, capacity
+/// ```
+///
+/// - LMAX approach: declare the entire engine state as a single large struct, allocate it once with a custom allocator pinned to a NUMA node, and never move it. The "slab" is just a field in that struct. In Rust this looks like using #[repr(C)] with explicit field ordering to control cache line layout.
+///
+/// The pointer indirection of Vec costs maybe 1-2 cycles on a cache-warm access. What actually kills you at HFT latency is:
+///
+/// Cache misses when the order you're accessing is cold (not recently touched)
+/// TLB misses when your slab spans thousands of 4KB pages
+/// False sharing when two CPU cores write to slots in the same cache line
+/// None of those are solved by switching from Vec to an array. They're solved by huge pages, NUMA-aware allocation, and cache-line padding between slots that different threads touch.
+///
+/// (2) Branchless programming, instead of pattern matching on trade side, maybe we can just
+/// rely on arithmetic
+///
+/// (3) There is some degree of cross-referentiality in our data structures. Instead of using indices
+/// we should use pointers.
+use std::collections::{BTreeSet, HashMap};
+
+pub struct OrderBook {
+    bids: HalfBook,
+    asks: HalfBook,
+    slab: OrderSlab,
+    /// order_id → (SlabIndex, Side, Price)
+    /// Required for O(1) cancel without scanning the book.
+    order_index: HashMap<OrderId, (SlabIndex, Side, Price)>,
+}
+
+/// What to do with unfilled quantity on a market order.
+/// CME products differ: futures use ImmediateOrCancel (partial fill ok),
+/// some options use FillOrKill (all-or-nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketOrderMode {
+    /// Fill as much as possible; cancel any unfilled remainder. Most common.
+    ImmediateOrCancel,
+    /// Fill everything or fill nothing. If full quantity unavailable, cancel
+    /// and return zero fills.
+    FillOrKill,
+}
+
+impl OrderBook {
+    pub fn new(slab_capacity: usize) -> Self {
+        Self {
+            bids: HalfBook::new(Side::Bid),
+            asks: HalfBook::new(Side::Ask),
+            slab: OrderSlab::with_capacity(slab_capacity),
+            order_index: HashMap::with_capacity(slab_capacity),
+        }
+    }
+
+    pub fn add_limit_order(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        price: Price,
+        quantity: u64,
+    ) -> Result<()> {
+        let new_order = Order {
+            order_id,
+            price,
+            quantity,
+            side,
+            prev: None,
+            next: None,
+        };
+
+        // Inserts order but with no linking
+        let order_idx = self.slab.insert_order(new_order)?;
+
+        // Updates price level and both l2 links as well as slab links
+        match side {
+            Side::Ask => &mut self
+                .asks
+                .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
+            Side::Bid => &mut self
+                .bids
+                .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
+        };
+
+        // Update order index
+        self.order_index.insert(order_id, (order_idx, side, price));
+
+        Ok(())
+    }
+
+    pub fn add_market_order(
+        &mut self,
+        order_id: OrderId,
+        side: Side,
+        quantity: u64,
+        mode: MarketOrderMode,
+    ) -> MarketOrderResult {
+        // NOTE: Considering the frquency of this happenening, it
+        // seems like a big price to pay to run this upfront. I think the
+        // best is to actually let it fail iteratively as it tries to fill
+        if mode == MarketOrderMode::FillOrKill {
+            // NOTE: this match seems superflous, instead of match
+            // we can have an bool 0 or 1, and then we index
+            // such that struct[0] = asks and struct[1] = bids, thus
+            // removing the branching
+            let available = match side {
+                Side::Bid => self
+                    .asks
+                    .price_index
+                    .iter()
+                    .filter_map(|p| self.asks.levels.get(p))
+                    .map(|l| l.quantity)
+                    .sum::<u64>(),
+                Side::Ask => self
+                    .asks
+                    .price_index
+                    .iter()
+                    .filter_map(|p| self.asks.levels.get(p))
+                    .map(|l| l.quantity)
+                    .sum::<u64>(),
+            };
+
+            if available < quantity {
+                // Insufficient liquidity — cancel entire order, zero fills.
+                return MarketOrderResult {
+                    fills: vec![],
+                    filled_quantity: 0,
+                    unfilled_qty: quantity,
+                    cancelled: true,
+                };
+            }
+        }
+
+        let mut fills = Vec::new();
+        let mut remaining = quantity;
+
+        loop {
+            if remaining == 0 {
+                break;
+            }
+
+            let best_price = match side {
+                Side::Bid => self.asks.best_price,
+                Side::Ask => self.bids.best_price,
+            };
+
+            let fill_price = match best_price {
+                Some(price) => price,
+                None => break, // Book is empty
+            };
+
+            let level = match side {
+                Side::Bid => self.asks.levels.get_mut(&fill_price),
+                Side::Ask => self.bids.levels.get_mut(&fill_price),
+            };
+
+            let level = match level {
+                Some(l) => l,
+                None => break,
+            };
+
+            let resting_idx = match level.head {
+                Some(i) => i,
+                None => break,
+            };
+
+            let order_ref = self.slab.get(resting_idx);
+            let resting_qty = order_ref.quantity;
+            let resting_id = order_ref.order_id;
+
+            // Figure out how much we can fill for this price level
+            let fill_qty = remaining.min(resting_qty);
+            // Reduce the remaining by the amount filled at this level
+            remaining -= fill_qty;
+
+            fills.push(Fill {
+                // TODO: Why are duplicating this? the aggressor ID is always the same, no need to
+                // copy this over and over..
+                aggressor_id: order_id,
+                resting_id,
+                price: fill_price,
+                quantity: fill_qty,
+            });
+
+            if fill_qty == resting_qty {
+                // Pop the fully filled resting order
+                let removed_idx = level.pop_front(&mut self.slab).unwrap();
+                self.order_index.remove(&resting_id);
+                self.slab.free(removed_idx);
+
+                // Update best price cache if level is empty
+                if level.is_empty() {
+                    match side {
+                        Side::Bid => {
+                            self.asks.levels.remove(&fill_price);
+                            self.asks.price_index.remove(&fill_price);
+                            todo!();
+                            // self.asks.update_best_price();
+                        }
+                        Side::Ask => {}
+                    }
+                }
+            } else {
+                self.slab.get_mut(resting_idx).quantity -= fill_qty;
+
+                let level = match side {
+                    Side::Bid => self.asks.levels.get_mut(&fill_price),
+                    Side::Ask => self.bids.levels.get_mut(&fill_price),
+                };
+
+                if let Some(level) = level {
+                    level.quantity -= fill_qty;
+                }
+            }
+        }
+
+        todo!();
+    }
+}
+
+pub struct HalfBook {
+    side: Side,
+    levels: HashMap<Price, PriceLevel>,
+    price_index: BTreeSet<Price>, // sorted; only walked on level drain
+    best_price: Option<Price>,
+}
+
+impl HalfBook {
+    fn new(side: Side) -> Self {
+        Self {
+            side,
+            levels: HashMap::new(),
+            price_index: BTreeSet::new(),
+            best_price: None,
+        }
+    }
+
+    fn push_order_to_l2_book_and_update_slab_links(
+        &mut self,
+        idx: SlabIndex,
+        slab: &mut OrderSlab,
+    ) {
+        let price = slab.get(idx).price;
+
+        // Get or insert level
+        let level = self.levels.entry(price).or_insert_with(|| {
+            // Add new price set
+            self.price_index.insert(price);
+
+            // Insert new price level
+            PriceLevel::new(price)
+        });
+
+        // Update price level and links
+        level.push_order_to_l2_level_and_update_slab_links(idx, slab);
+
+        // Check if it's the new best
+        let is_new_best = match self.best_price {
+            None => true,
+            Some(best) => match self.side {
+                Side::Bid => price > best,
+                Side::Ask => price < best,
+            },
+        };
+        if is_new_best {
+            self.best_price = Some(price);
+        }
+    }
+}
+
+/// Fixed-point price. 1 unit = 1 tick of the instrument.
+/// All price arithmetic is integer arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Price(pub u64);
+
+pub struct PriceLevel {
+    pub price: Price,
+    pub quantity: u64,
+    pub head: Option<SlabIndex>,
+    pub tail: Option<SlabIndex>,
+    pub order_count: u32,
+}
+
+impl PriceLevel {
+    pub fn new(price: Price) -> Self {
+        Self {
+            price,
+            quantity: 0,
+            head: None,
+            tail: None,
+            order_count: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    pub fn push_order_to_l2_level_and_update_slab_links(
+        &mut self,
+        idx: SlabIndex,
+        slab: &mut OrderSlab,
+    ) {
+        let order = slab.get_mut(idx);
+
+        // Fill the order vertices
+        order.prev = self.tail; // new tail is formed, and pointing to the previous tail
+
+        if let Some(tail_idx) = self.tail {
+            // Reach out to previous tail and have it point to the new tail
+            slab.get_mut(tail_idx).next = Some(idx);
+        } else {
+            // Queue was empty; new order is also the head.
+            self.head = Some(idx);
+        }
+
+        // Update the tail of the price level
+        self.tail = Some(idx);
+
+        // Register quantity and counts
+        self.quantity = slab.get(idx).quantity;
+        self.order_count += 1;
+    }
+
+    /// Remove the front order from the queue. O(1).
+    /// Returns the SlabIndex of the removed order.
+    pub fn pop_front(&mut self, slab: &mut OrderSlab) -> Option<SlabIndex> {
+        let head_idx = self.head?;
+        let next = slab.get(head_idx).next;
+
+        if let Some(next_idx) = next {
+            // We informe the next order slot that the previous
+            // order slot is now free
+            slab.get_mut(next_idx).prev = None;
+        } else {
+            // If there is no next slot then it means the order queue is empty
+            self.tail = None;
+        };
+        self.head = next;
+
+        self.quantity -= slab.get(head_idx).quantity;
+        self.order_count -= 1;
+
+        Some(head_idx)
+    }
+}
+
+/// The slab allocator.
+pub struct OrderSlab {
+    slots: Vec<OrderSlot>,
+    free_head: Option<u32>, // head of the free list
+    capacity: usize,
+}
+
+impl OrderSlab {
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "slab capacity must be non-zero");
+
+        let mut slots = Vec::with_capacity(capacity);
+
+        for i in 0..capacity {
+            slots.push(OrderSlot::Free {
+                next_free: Some((i + 1) as u32),
+            })
+        }
+
+        Self {
+            slots: Vec::with_capacity(capacity),
+            free_head: Some(0),
+            capacity,
+        }
+    }
+
+    pub fn get(&self, idx: SlabIndex) -> &Order {
+        match &self.slots[idx.0 as usize] {
+            OrderSlot::Occupied(order) => order,
+            OrderSlot::Free { .. } => panic!("get() on free slot {:?}", idx),
+        }
+    }
+
+    pub fn get_mut(&mut self, idx: SlabIndex) -> &mut Order {
+        match &mut self.slots[idx.0 as usize] {
+            OrderSlot::Occupied(order) => order,
+            OrderSlot::Free { .. } => panic!("get_mut() on free slot {:?}", idx),
+        }
+    }
+
+    pub fn free(&mut self, idx: SlabIndex) {
+        let old_head = self.free_head;
+        self.slots[idx.0 as usize] = OrderSlot::Free {
+            next_free: old_head,
+        };
+        self.free_head = Some(idx.0);
+    }
+
+    pub fn insert_order(&mut self, order: Order) -> Result<SlabIndex> {
+        if let Some(idx) = self.free_head {
+            let slot = &self.slots[idx as usize];
+
+            // This is the type of error catching we want to find in exhaustive testing
+            // but eliminate it out of prod code
+            self.free_head = match slot {
+                OrderSlot::Free { next_free } => *next_free,
+                OrderSlot::Occupied(_) => unreachable!("free list points to occupied slot"),
+            };
+
+            self.slots[idx as usize] = OrderSlot::Occupied(order);
+            Ok(SlabIndex(idx))
+        } else {
+            return Err(anyhow!("Slab is full"));
+        }
+    }
+}
+
+/// A slot in the slab — either occupied or free (part of free list).
+#[derive(Debug)]
+enum OrderSlot {
+    Occupied(Order),
+    Free { next_free: Option<u32> }, // index of next free slot
+}
+
+/// A resting limit order.
+#[derive(Debug, Clone)]
+pub struct Order {
+    pub order_id: OrderId,
+    pub price: Price,
+    pub quantity: u64, // remaining quantity (decremented on partial fill)
+    pub side: Side,
+
+    // Intrusive linked list pointers within a price level's FIFO queue.
+    // None = this is the head (prev) or tail (next) of the queue.
+    // These are slab indices, not raw pointers — safe to store in a Vec.
+    pub prev: Option<SlabIndex>, // order ahead in queue (older, higher priority)
+    pub next: Option<SlabIndex>, // order behind in queue (newer, lower priority)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OrderId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Bid,
+    Ask,
+}
+
+/// Index into the slab — this is what we store instead of Box<Order>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlabIndex(pub u32);
+
+#[derive(Debug)]
+pub struct MarketOrderResult {
+    pub fills: Vec<Fill>,
+    pub filled_quantity: u64,
+    pub unfilled_qty: u64, // > 0 means partial fill (IOC) or full cancel (FOK)
+    pub cancelled: bool,   // true if any quantity was cancelled
+}
+
+#[derive(Debug)]
+pub struct Fill {
+    pub aggressor_id: OrderId,
+    pub resting_id: OrderId,
+    pub price: Price,
+    pub quantity: u64,
+}
