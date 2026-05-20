@@ -61,6 +61,9 @@ impl OrderBook {
         }
     }
 
+    // (1) Inserts order in slab
+    // (2) Updates price limit and links
+    // (3) Updates order index map
     pub fn add_limit_order(
         &mut self,
         order_id: OrderId,
@@ -92,6 +95,31 @@ impl OrderBook {
 
         // Update order index
         self.order_index.insert(order_id, (order_idx, side, price));
+
+        Ok(())
+    }
+
+    // (3) Removes order index map
+    // (2) Updates price limit and links
+    // (1) Inserts order in slab
+    pub fn cancel_limit_order(&mut self, order_id: OrderId) -> Result<()> {
+        let (idx, side, price) = self
+            .order_index
+            .remove(&order_id)
+            .ok_or_else(|| anyhow!("Order not found"))?;
+
+        match side {
+            Side::Bid => self.bids.remove_order_from_l2_book_and_update_slab_links(
+                idx,
+                price,
+                &mut self.slab,
+            ),
+            Side::Ask => self.asks.remove_order_from_l2_book_and_update_slab_links(
+                idx,
+                price,
+                &mut self.slab,
+            ),
+        }
 
         Ok(())
     }
@@ -243,6 +271,40 @@ impl HalfBook {
         }
     }
 
+    /// (1) Update price level and stich slab links
+    /// (2) Remove price level if empty (-price_index)
+    /// (3) Refresh best price
+    fn remove_order_from_l2_book_and_update_slab_links(
+        &mut self,
+        idx: SlabIndex,
+        price: Price,
+        slab: &mut OrderSlab,
+    ) {
+        if let Some(level) = self.levels.get_mut(&price) {
+            level.remove(idx, slab);
+
+            if level.is_empty() {
+                self.levels.remove(&price);
+                self.price_index.remove(&price);
+
+                // Refresh the best price if needed
+                if self.best_price == Some(price) {
+                    self.update_best_price();
+                };
+            }
+        }
+    }
+
+    fn update_best_price(&mut self) {
+        self.best_price = match self.side {
+            Side::Bid => self.price_index.iter().next_back().copied(),
+            Side::Ask => self.price_index.iter().next().copied(),
+        };
+    }
+
+    /// (1) Get or insert price level (+price index)
+    /// (2) Push order to price level and update links
+    /// (3) Refresh new best
     fn push_order_to_l2_book_and_update_slab_links(
         &mut self,
         idx: SlabIndex,
@@ -302,6 +364,38 @@ impl PriceLevel {
 
     pub fn is_empty(&self) -> bool {
         self.head.is_none()
+    }
+
+    // Remove arbitrary order (useful for cancel)
+    // Say there are three orders:
+    // A <- B <- C
+    // If we remove B we have to stich the graph:
+    // A <- C
+    pub fn remove(&mut self, idx: SlabIndex, slab: &mut OrderSlab) {
+        let (prev, next, qty) = {
+            let o = slab.get(idx);
+            (o.prev, o.next, o.quantity)
+        };
+
+        // Patch the previous order's `next` pointer.
+        match prev {
+            // Stich previous to next
+            Some(p_idx) => slab.get_mut(p_idx).next = next,
+            // If no previous it means its the head, therefore update price level head
+            None => self.head = next, // was the head
+        };
+
+        // Patch the next order's `prev` pointer.
+        match next {
+            // Stich next to previous
+            Some(n_idx) => slab.get_mut(n_idx).prev = prev,
+            // If no next it means its the tail, therefore update price level tail
+            None => self.tail = prev,
+        };
+
+        // Update quantity and count
+        self.quantity -= qty;
+        self.order_count -= 1;
     }
 
     pub fn push_order_to_l2_level_and_update_slab_links(
