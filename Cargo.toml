@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+rand = { workspace = true }
+
+[[bench]]
+name = "hmap_book"
+harness = false
