@@ -61,42 +61,153 @@ impl OrderBook {
         }
     }
 
-    // (1) Inserts order in slab
-    // (2) Updates price limit and links
-    // (3) Updates order index map
+    /// Sweep the opposite side, consuming resting orders until either:
+    ///   - `remaining` reaches 0,
+    ///   - the book is empty on that side, or
+    ///   - `price_limit` is set and the next best opposite no longer crosses it.
+    ///
+    /// `price_limit = None` → market-order semantics (sweep unconditionally).
+    /// `price_limit = Some(p)` → limit-order semantics:
+    ///   - Bid aggressor crosses iff `p >= best_ask`
+    ///   - Ask aggressor crosses iff `p <= best_bid`
+    ///
+    /// Returns the produced fills and the unfilled remainder.
+    /// Does NOT rest the remainder — callers decide what to do with it.
+    fn match_against_opposite(
+        &mut self,
+        aggressor_id: OrderId,
+        side: Side,
+        price_limit: Option<Price>,
+        quantity: u64,
+    ) -> (Vec<Fill>, u64) {
+        let mut fills = Vec::new();
+        let mut remaining = quantity;
+
+        while remaining > 0 {
+            // 1) Best price on the opposite side.
+            let best_opposite = match side {
+                Side::Bid => self.asks.best_price,
+                Side::Ask => self.bids.best_price,
+            };
+            let fill_price = match best_opposite {
+                Some(p) => p,
+                None => break, // opposite side is empty
+            };
+
+            // 2) Limit-order stop condition: bail if our price no longer crosses.
+            if let Some(limit) = price_limit {
+                let crosses = match side {
+                    Side::Bid => limit >= fill_price,
+                    Side::Ask => limit <= fill_price,
+                };
+                if !crosses {
+                    break;
+                }
+            }
+
+            // 3) Pull the head order of the best level on the opposite side.
+            let level = match side {
+                Side::Bid => self.asks.levels.get_mut(&fill_price),
+                Side::Ask => self.bids.levels.get_mut(&fill_price),
+            };
+            let level = match level {
+                Some(l) => l,
+                None => break, // best_price desync — defensive break
+            };
+            let resting_idx = match level.head {
+                Some(i) => i,
+                None => break,
+            };
+
+            let order_ref = self.slab.get(resting_idx);
+            let resting_qty = order_ref.quantity;
+            let resting_id = order_ref.order_id;
+
+            let fill_qty = remaining.min(resting_qty);
+            remaining -= fill_qty;
+
+            fills.push(Fill {
+                aggressor_id,
+                resting_id,
+                price: fill_price,
+                quantity: fill_qty,
+            });
+
+            // 4) Settle the resting order: full or partial.
+            // (4.1) Inserts order in slab
+            // (4.2) Updates price limit and links
+            // (4.3) Updates order index map
+            if fill_qty == resting_qty {
+                let removed_idx = match side {
+                    Side::Bid => self
+                        .asks
+                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
+                    Side::Ask => self
+                        .bids
+                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
+                };
+                match removed_idx {
+                    Ok(idx) => {
+                        self.order_index.remove(&resting_id);
+                        self.slab.free(idx);
+                    }
+                    Err(_) => break, // defensive: structural inconsistency
+                }
+            } else {
+                self.slab.get_mut(resting_idx).quantity -= fill_qty;
+                let level = match side {
+                    Side::Bid => self.asks.levels.get_mut(&fill_price),
+                    Side::Ask => self.bids.levels.get_mut(&fill_price),
+                };
+                if let Some(level) = level {
+                    level.quantity -= fill_qty;
+                }
+            }
+        }
+
+        (fills, remaining)
+    }
+
+    // (1) Match against the opposite side up to `price`
+    // (2) Rest any unfilled remainder on our own side
+    //     (a) Insert order in slab
+    //     (b) Update price level and slab links
+    //     (c) Update order index map
     pub fn add_limit_order(
         &mut self,
         order_id: OrderId,
         side: Side,
         price: Price,
         quantity: u64,
-    ) -> Result<()> {
-        let new_order = Order {
-            order_id,
-            price,
-            quantity,
-            side,
-            prev: None,
-            next: None,
-        };
+    ) -> Result<Vec<Fill>> {
+        // Limit semantics: stop matching when price no longer crosses.
+        let (fills, remaining) = self.match_against_opposite(order_id, side, Some(price), quantity);
 
-        // Inserts order but with no linking
-        let order_idx = self.slab.insert_order(new_order)?;
+        if remaining > 0 {
+            let new_order = Order {
+                order_id,
+                price,
+                quantity: remaining,
+                side,
+                prev: None,
+                next: None,
+            };
 
-        // Updates price level and both l2 links as well as slab links
-        match side {
-            Side::Ask => &mut self
-                .asks
-                .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
-            Side::Bid => &mut self
-                .bids
-                .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
-        };
+            let order_idx = self.slab.insert_order(new_order)?;
 
-        // Update order index
-        self.order_index.insert(order_id, (order_idx, side, price));
+            match side {
+                Side::Ask => self
+                    .asks
+                    .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
+                Side::Bid => self
+                    .bids
+                    .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
+            };
 
-        Ok(())
+            self.order_index.insert(order_id, (order_idx, side, price));
+        }
+
+        Ok(fills)
     }
 
     // (3) Removes order index map
@@ -124,6 +235,9 @@ impl OrderBook {
         Ok(())
     }
 
+    // (1) Inserts order in slab
+    // (2) Updates price limit and links
+    // (3) Updates order index map
     pub fn add_market_order(
         &mut self,
         order_id: OrderId,
@@ -148,10 +262,10 @@ impl OrderBook {
                     .map(|l| l.quantity)
                     .sum::<u64>(),
                 Side::Ask => self
-                    .asks
+                    .bids
                     .price_index
                     .iter()
-                    .filter_map(|p| self.asks.levels.get(p))
+                    .filter_map(|p| self.bids.levels.get(p))
                     .map(|l| l.quantity)
                     .sum::<u64>(),
             };
@@ -167,88 +281,8 @@ impl OrderBook {
             }
         }
 
-        let mut fills = Vec::new();
-        let mut remaining = quantity;
-
-        loop {
-            if remaining == 0 {
-                break;
-            }
-
-            let best_price = match side {
-                Side::Bid => self.asks.best_price,
-                Side::Ask => self.bids.best_price,
-            };
-
-            let fill_price = match best_price {
-                Some(price) => price,
-                None => break, // Book is empty
-            };
-
-            let level = match side {
-                Side::Bid => self.asks.levels.get_mut(&fill_price),
-                Side::Ask => self.bids.levels.get_mut(&fill_price),
-            };
-
-            let level = match level {
-                Some(l) => l,
-                None => break,
-            };
-
-            let resting_idx = match level.head {
-                Some(i) => i,
-                None => break,
-            };
-
-            let order_ref = self.slab.get(resting_idx);
-            let resting_qty = order_ref.quantity;
-            let resting_id = order_ref.order_id;
-
-            // Figure out how much we can fill for this price level
-            let fill_qty = remaining.min(resting_qty);
-            // Reduce the remaining by the amount filled at this level
-            remaining -= fill_qty;
-
-            fills.push(Fill {
-                // TODO: Why are duplicating this? the aggressor ID is always the same, no need to
-                // copy this over and over..
-                aggressor_id: order_id,
-                resting_id,
-                price: fill_price,
-                quantity: fill_qty,
-            });
-
-            // (1) Updates price limit and links
-            // (2) Removes order index map
-            // (3) Removes order from slab
-            if fill_qty == resting_qty {
-                // Pop the fully filled resting order
-                let removed_idx = match side {
-                    Side::Bid => self
-                        .asks
-                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
-                    Side::Ask => self
-                        .bids
-                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
-                }?;
-
-                self.order_index.remove(&resting_id);
-                self.slab.free(removed_idx);
-            } else {
-                // No need to update links in this branch
-                self.slab.get_mut(resting_idx).quantity -= fill_qty;
-
-                let level = match side {
-                    Side::Bid => self.asks.levels.get_mut(&fill_price),
-                    Side::Ask => self.bids.levels.get_mut(&fill_price),
-                };
-
-                if let Some(level) = level {
-                    level.quantity -= fill_qty;
-                }
-            }
-        }
-
+        // Market = sweep unconditionally → price_limit = None.
+        let (fills, remaining) = self.match_against_opposite(order_id, side, None, quantity);
         let filled_quantity = quantity - remaining;
         let cancelled = remaining > 0;
 
