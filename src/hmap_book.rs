@@ -30,13 +30,19 @@ use anyhow::{Result, anyhow};
 /// we should use pointers.
 use std::collections::{BTreeSet, HashMap};
 
-pub struct OrderBook {
+pub struct OrderBook<C: FillConsumer> {
     bids: HalfBook,
     asks: HalfBook,
     slab: OrderSlab,
     /// order_id → (SlabIndex, Side, Price)
     /// Required for O(1) cancel without scanning the book.
     order_index: HashMap<OrderId, (SlabIndex, Side, Price)>,
+    /// Fill sink. Bound at the type level — `C` is chosen by the binary that
+    /// constructs the `OrderBook`. The matcher calls `consumer.on_fill(...)`
+    /// once per fill; because `C` is a concrete type and `on_fill` is
+    /// `#[inline(always)]`, the call monomorphizes + inlines into the
+    /// matching loop. Identical generated code to hardcoding the consumer.
+    pub consumer: C,
 }
 
 /// What to do with unfilled quantity on a market order.
@@ -51,13 +57,20 @@ pub enum MarketOrderMode {
     FillOrKill,
 }
 
-impl OrderBook {
+impl<C: FillConsumer + Default> OrderBook<C> {
     pub fn new(slab_capacity: usize) -> Self {
+        Self::with_consumer(slab_capacity, C::default())
+    }
+}
+
+impl<C: FillConsumer> OrderBook<C> {
+    pub fn with_consumer(slab_capacity: usize, consumer: C) -> Self {
         Self {
             bids: HalfBook::new(Side::Bid),
             asks: HalfBook::new(Side::Ask),
             slab: OrderSlab::with_capacity(slab_capacity),
             order_index: HashMap::with_capacity(slab_capacity),
+            consumer,
         }
     }
 
@@ -71,16 +84,13 @@ impl OrderBook {
     ///   - Bid aggressor crosses iff `p >= best_ask`
     ///   - Ask aggressor crosses iff `p <= best_bid`
     ///
-    /// Returns the produced fills and the unfilled remainder.
-    /// Does NOT rest the remainder — callers decide what to do with it.
+    #[inline(always)]
     fn match_against_opposite(
         &mut self,
-        aggressor_id: OrderId,
         side: Side,
         price_limit: Option<Price>,
         quantity: u64,
-    ) -> Result<(Vec<Fill>, u64)> {
-        let mut fills = Vec::new();
+    ) -> Result<u64> {
         let mut remaining = quantity;
 
         while remaining > 0 {
@@ -126,10 +136,8 @@ impl OrderBook {
             let fill_qty = remaining.min(resting_qty);
             remaining -= fill_qty;
 
-            fills.push(Fill {
-                aggressor_id,
+            self.consumer.on_fill(Fill {
                 resting_id,
-                price: fill_price,
                 quantity: fill_qty,
             });
 
@@ -160,7 +168,7 @@ impl OrderBook {
             }
         }
 
-        Ok((fills, remaining))
+        Ok(remaining)
     }
 
     // (1) Match against the opposite side up to `price`
@@ -174,10 +182,9 @@ impl OrderBook {
         side: Side,
         price: Price,
         quantity: u64,
-    ) -> Result<Vec<Fill>> {
+    ) -> Result<()> {
         // Limit semantics: stop matching when price no longer crosses.
-        let (fills, remaining) =
-            self.match_against_opposite(order_id, side, Some(price), quantity)?;
+        let remaining = self.match_against_opposite(side, Some(price), quantity)?;
 
         if remaining > 0 {
             let new_order = Order {
@@ -203,7 +210,8 @@ impl OrderBook {
             self.order_index.insert(order_id, (order_idx, side, price));
         }
 
-        Ok(fills)
+        self.consumer.flush();
+        Ok(())
     }
 
     // (3) Removes order index map
@@ -236,7 +244,7 @@ impl OrderBook {
     // (3) Updates order index map
     pub fn add_market_order(
         &mut self,
-        order_id: OrderId,
+        _order_id: OrderId,
         side: Side,
         quantity: u64,
         mode: MarketOrderMode,
@@ -269,7 +277,6 @@ impl OrderBook {
             if available < quantity {
                 // Insufficient liquidity — cancel entire order, zero fills.
                 return Ok(MarketOrderResult {
-                    fills: vec![],
                     filled_quantity: 0,
                     unfilled_qty: quantity,
                     cancelled: true,
@@ -278,12 +285,12 @@ impl OrderBook {
         }
 
         // Market = sweep unconditionally → price_limit = None.
-        let (fills, remaining) = self.match_against_opposite(order_id, side, None, quantity)?;
+        let remaining = self.match_against_opposite(side, None, quantity)?;
         let filled_quantity = quantity - remaining;
         let cancelled = remaining > 0;
 
+        self.consumer.flush();
         Ok(MarketOrderResult {
-            fills,
             filled_quantity,
             unfilled_qty: remaining,
             cancelled,
@@ -623,7 +630,6 @@ pub struct SlabIndex(pub u32);
 
 #[derive(Debug)]
 pub struct MarketOrderResult {
-    pub fills: Vec<Fill>,
     pub filled_quantity: u64,
     pub unfilled_qty: u64, // > 0 means partial fill (IOC) or full cancel (FOK)
     pub cancelled: bool,   // true if any quantity was cancelled
@@ -631,8 +637,32 @@ pub struct MarketOrderResult {
 
 #[derive(Debug)]
 pub struct Fill {
-    pub aggressor_id: OrderId,
     pub resting_id: OrderId,
-    pub price: Price,
     pub quantity: u64,
+}
+
+pub trait FillConsumer {
+    fn on_fill(&mut self, fill: Fill);
+
+    /// Called by the matcher at the end of every public operation
+    /// (`add_limit_order`, `add_market_order`), after all of that
+    /// operation's fills have been delivered via `on_fill`. Consumers that
+    /// buffer fills internally (e.g. a batched ring-buffer publisher) use
+    /// this as their commit point. Default is a no-op — the per-fill
+    /// `on_fill` path is the only thing that matters for consumers that
+    /// don't batch (Vec, immediate-publish).
+    #[inline(always)]
+    fn flush(&mut self) {}
+}
+
+/// Collects every fill into a `Vec<Fill>` owned by the consumer.
+#[derive(Default)]
+pub struct VecConsumer {
+    pub fills: Vec<Fill>,
+}
+impl FillConsumer for VecConsumer {
+    #[inline(always)]
+    fn on_fill(&mut self, fill: Fill) {
+        self.fills.push(fill);
+    }
 }
