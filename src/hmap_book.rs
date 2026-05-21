@@ -390,24 +390,16 @@ impl<C: FillConsumer> OrderBook<C> {
             if available < quantity {
                 // Insufficient liquidity — cancel entire order, zero fills.
                 return Ok(MarketOrderResult {
-                    filled_quantity: 0,
-                    unfilled_qty: quantity,
-                    cancelled: true,
+                    remaining: quantity,
                 });
             }
         }
 
         // Market = sweep unconditionally → price_limit = None.
         let remaining = self.match_against_opposite(side, None, quantity)?;
-        let filled_quantity = quantity - remaining;
-        let cancelled = remaining > 0;
 
         self.consumer.flush();
-        Ok(MarketOrderResult {
-            filled_quantity,
-            unfilled_qty: remaining,
-            cancelled,
-        })
+        Ok(MarketOrderResult { remaining })
     }
 }
 
@@ -730,11 +722,38 @@ impl SlabIndex {
     }
 }
 
-#[derive(Debug)]
+/// Outcome of a market order. Carries only `remaining` (the unfilled
+/// quantity); `filled` is a pure function of the requested quantity, which
+/// the caller already has in scope.
+///
+/// Storing `remaining` rather than `filled` matches the matcher's internal
+/// variable, so the construction site (`MarketOrderResult { remaining }`)
+/// does literally zero arithmetic, and `cancelled()` becomes a free check
+/// (`remaining > 0`) that doesn't need the requested quantity passed in.
+///
+/// `#[repr(transparent)]` makes this ABI-identical to a bare `u64`: returned
+/// in a register instead of via `sret`, and `Result<MarketOrderResult,
+/// BookError>` fits in 16 bytes (two registers on AArch64) instead of the
+/// 32-byte struct that the previous 3-field layout forced through stack
+/// memory.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketOrderResult {
-    pub filled_quantity: u64,
-    pub unfilled_qty: u64, // > 0 means partial fill (IOC) or full cancel (FOK)
-    pub cancelled: bool,   // true if any quantity was cancelled
+    pub remaining: u64,
+}
+
+impl MarketOrderResult {
+    /// Quantity that was actually filled.
+    #[inline(always)]
+    pub fn filled(self, requested: u64) -> u64 {
+        requested - self.remaining
+    }
+
+    /// True if any quantity was cancelled (partial-fill IOC or full FOK kill).
+    #[inline(always)]
+    pub fn cancelled(self) -> bool {
+        self.remaining > 0
+    }
 }
 
 #[derive(Debug)]
