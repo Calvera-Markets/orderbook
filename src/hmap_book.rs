@@ -303,7 +303,6 @@ impl<C: FillConsumer> OrderBook<C> {
                 order_id,
                 price,
                 quantity: remaining,
-                side,
                 prev: None,
                 next: None,
             };
@@ -609,12 +608,11 @@ impl OrderSlab {
             };
             // Placeholder `Order` — only `next` (the freelist link) is
             // meaningful while the slot is free.
-            // TODO: init through Default trait, but we need to remove the side first
+            // TODO: init through Default trait
             slots.push(Order {
                 order_id: OrderId(0),
                 price: Price(0),
                 quantity: 0,
-                side: Side::Bid,
                 prev: None,
                 next: next_free,
             });
@@ -663,8 +661,6 @@ pub struct Order {
     pub order_id: OrderId,
     pub price: Price,
     pub quantity: u64, // remaining quantity (decremented on partial fill)
-    pub side: Side,
-
     // Intrusive linked list pointers within a price level's FIFO queue.
     // None = this is the head (prev) or tail (next) of the queue.
     // These are slab indices, not raw pointers — safe to store in a Vec.
