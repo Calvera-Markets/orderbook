@@ -27,6 +27,33 @@
 ///
 /// (3) There is some degree of cross-referentiality in our data structures. Instead of using indices
 /// we should use pointers.
+
+//! 1. **No `OrderSlot` enum.** The slab stores `Order` directly. When a slot is
+//!    on the freelist, its `Order.next` field is repurposed as the freelist
+//!    link; the other `Order` fields are garbage and must not be read. Drops
+//!    the 8-byte discriminant + alignment from every slot.
+//!
+//! 2. **Per-level batched matching.** `match_against_opposite` looks the
+//!    `PriceLevel` up once per level (not once per fill), walks the FIFO via
+//!    `Order.next` reads only, and updates `level.{quantity, order_count,
+//!    head}` exactly once when leaving the level — instead of once per
+//!    consumed order.
+//!
+//! 3. **Bulk slab free.** Fully-consumed orders are *not* returned to the
+//!    freelist one-at-a-time. The level's existing FIFO chain (already linked
+//!    via `Order.next`) is the freed chain; across multiple drained levels in
+//!    one sweep, the per-level chains are stitched with a single write per
+//!    level boundary. At end-of-sweep the whole chain is spliced into
+//!    `free_head` with one more write. Slab writes during a sweep go from
+//!    O(consumed orders) to O(level boundaries).
+//!
+//! 4. **Bug-fix carryover.** `cancel_limit_order` now calls `slab.free` after
+//!    unlinking — v1 leaked the slot.
+//!
+//! What did NOT change: FOK pre-scan (still O(levels)), the `match side` arms
+//! threaded through the hot path, and the `HashMap<OrderId, …>` order index.
+//! All separately discussed; out of scope for this change.
+
 use std::collections::{BTreeSet, HashMap};
 
 use crate::errors::{BookError, BookResult};
@@ -85,6 +112,16 @@ impl<C: FillConsumer> OrderBook<C> {
     ///   - Bid aggressor crosses iff `p >= best_ask`
     ///   - Ask aggressor crosses iff `p <= best_bid`
     ///
+    /// Matching is structured as nested loops:
+    ///   - outer (sweep): iterates over price levels of the opposite side
+    ///   - inner (level walk): consumes orders from the head of one level,
+    ///     reading only `Order.next` and writing nothing to the slab in the
+    ///     full-consume steady state
+    ///
+    /// Freed orders are collected into a per-level chain (via the already-
+    /// linked `Order.next` pointers) and stitched across levels with one
+    /// write per level boundary. The final chain is spliced into `free_head`
+    /// once when the sweep ends.
     #[inline(always)]
     fn match_against_opposite(
         &mut self,
@@ -92,9 +129,12 @@ impl<C: FillConsumer> OrderBook<C> {
         price_limit: Option<Price>,
         quantity: u64,
     ) -> BookResult<u64> {
+        // TODO: This function needs a cleanup
         let mut remaining = quantity;
+        let mut freed_chain_head: Option<SlabIndex> = None;
+        let mut freed_chain_tail: Option<SlabIndex> = None;
 
-        while remaining > 0 {
+        'sweep: while remaining > 0 {
             // 1) Best price on the opposite side.
             let best_opposite = match side {
                 Side::Bid => self.asks.best_price,
@@ -102,7 +142,7 @@ impl<C: FillConsumer> OrderBook<C> {
             };
             let fill_price = match best_opposite {
                 Some(p) => p,
-                None => break, // opposite side is empty
+                None => break,
             };
 
             // 2) Limit-order stop condition: bail if our price no longer crosses.
@@ -116,57 +156,155 @@ impl<C: FillConsumer> OrderBook<C> {
                 }
             }
 
-            // 3) Pull the head order of the best level on the opposite side.
-            let level = match side {
-                Side::Bid => self.asks.levels.get_mut(&fill_price),
-                Side::Ask => self.bids.levels.get_mut(&fill_price),
-            };
-            let level = match level {
-                Some(l) => l,
-                None => break, // best_price desync — defensive break
-            };
-            let resting_idx = match level.head {
-                Some(i) => i,
-                None => break,
-            };
-
-            let order_ref = self.slab.get(resting_idx);
-            let resting_qty = order_ref.quantity;
-            let resting_id = order_ref.order_id;
-
-            let fill_qty = remaining.min(resting_qty);
-            remaining -= fill_qty;
-
-            self.consumer.on_fill(Fill {
-                resting_id,
-                quantity: fill_qty,
-            });
-
-            // 4) Settle the resting order: full or partial.
-            // (4.1) Inserts order in slab
-            // (4.2) Updates price limit and links
-            // (4.3) Updates order index map
-            if fill_qty == resting_qty {
-                let removed_idx = match side {
-                    Side::Bid => self
-                        .asks
-                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
-                    Side::Ask => self
-                        .bids
-                        .pop_order_from_l2_book_and_update_slab_links(fill_price, &mut self.slab),
-                }?;
-                self.order_index.remove(&resting_id);
-                self.slab.free(removed_idx);
-            } else {
-                self.slab.get_mut(resting_idx).quantity -= fill_qty;
-                let level = match side {
+            // 3) Walk this level. Inner scope so the `&mut PriceLevel` borrow
+            //    ends before we mutate sibling fields of the HalfBook below
+            //    (levels.remove, price_index.remove, update_best_price).
+            //
+            //    `level_freed` carries the per-level freed chain out of the
+            //    inner block. We avoid an Option for `level_last_freed` (and
+            //    its per-iteration `is_none()` branch) by initializing it to
+            //    the level head and only reading it when `consumed_count > 0`.
+            let mut consumed_count: u32 = 0;
+            let mut level_freed: Option<(SlabIndex, SlabIndex)> = None;
+            let level_drained: bool;
+            {
+                let level_opt = match side {
                     Side::Bid => self.asks.levels.get_mut(&fill_price),
                     Side::Ask => self.bids.levels.get_mut(&fill_price),
                 };
-                if let Some(level) = level {
-                    level.quantity -= fill_qty;
+                let level = match level_opt {
+                    Some(l) => l,
+                    None => break 'sweep, // best_price desync — defensive
+                };
+                let head = match level.head {
+                    Some(i) => i,
+                    None => break 'sweep, // empty level — defensive
+                };
+                let mut current_idx = head;
+                let mut level_last_freed: SlabIndex = head; // only valid when consumed_count > 0
+                let mut consumed_qty: u64 = 0;
+
+                level_drained = loop {
+                    // Read everything we need from the slot in one shot. After
+                    // this we either fully consume (no slab write in this iter)
+                    // or partially consume (one slab write at the end).
+                    let slot = &self.slab.slots[current_idx.0 as usize];
+                    let resting_qty = slot.quantity;
+                    let resting_id = slot.order_id;
+                    let next_idx = slot.next;
+
+                    let fill_qty = remaining.min(resting_qty);
+                    remaining -= fill_qty;
+                    self.consumer.on_fill(Fill {
+                        resting_id,
+                        quantity: fill_qty,
+                    });
+
+                    if fill_qty == resting_qty {
+                        // Full consume. Donate to this level's freed chain
+                        // (no slab write — already linked via `Order.next`).
+                        self.order_index.remove(&resting_id);
+                        consumed_qty += fill_qty;
+                        consumed_count += 1;
+                        level_last_freed = current_idx;
+
+                        // Two cases — folded along `next_idx`, not on the
+                        // 2x2 of (remaining == 0, next_idx). The
+                        // `next_idx == None` cases were identical anyway.
+                        match next_idx {
+                            Some(n) => {
+                                if remaining == 0 {
+                                    // Satisfied; `n` is the new head. Clear
+                                    // its stale `prev` (was pointing at the
+                                    // now-freed `current_idx`) and settle
+                                    // level counters once.
+                                    self.slab.slots[n.0 as usize].prev = None;
+                                    level.head = Some(n);
+                                    level.quantity -= consumed_qty;
+                                    level.order_count -= consumed_count;
+                                    break false;
+                                }
+                                current_idx = n;
+                            }
+                            None => {
+                                // Level drained. Whether `remaining` is 0 or
+                                // not, the outer sweep handles it: if 0 we
+                                // exit; if not, we move to the next best
+                                // price.
+                                level.head = None;
+                                level.tail = None;
+                                level.quantity = 0;
+                                level.order_count = 0;
+                                break true;
+                            }
+                        }
+                    } else {
+                        // Partial consume. This is always the terminator —
+                        // `remaining` is now 0. `current_idx` survives as the
+                        // new head; its `prev` may still point to a now-freed
+                        // slot, so clear it unconditionally (cheaper than
+                        // branching on whether anything was freed earlier).
+                        let s = &mut self.slab.slots[current_idx.0 as usize];
+                        s.quantity -= fill_qty;
+                        s.prev = None;
+                        consumed_qty += fill_qty;
+                        level.head = Some(current_idx);
+                        level.quantity -= consumed_qty;
+                        level.order_count -= consumed_count;
+                        break false;
+                    }
+                };
+
+                if consumed_count > 0 {
+                    // `head` is the level's original head — i.e. the first
+                    // order we fully consumed. `level_last_freed` is the
+                    // most recent.
+                    level_freed = Some((head, level_last_freed));
                 }
             }
+
+            // 4) Stitch this level's freed chain into the sweep's freed chain.
+            //    Within a level the chain is already linked via `Order.next`,
+            //    so we only need one slab write to bridge across levels.
+            if let Some((lf_head, lf_tail)) = level_freed {
+                match freed_chain_tail {
+                    Some(prev_tail) => {
+                        self.slab.slots[prev_tail.0 as usize].next = Some(lf_head);
+                    }
+                    None => {
+                        freed_chain_head = Some(lf_head);
+                    }
+                }
+                freed_chain_tail = Some(lf_tail);
+            }
+
+            // 5) If we fully drained the level, remove it from the half-book.
+            if level_drained {
+                match side {
+                    Side::Bid => {
+                        self.asks.levels.remove(&fill_price);
+                        self.asks.price_index.remove(&fill_price);
+                        if self.asks.best_price == Some(fill_price) {
+                            self.asks.update_best_price();
+                        }
+                    }
+                    Side::Ask => {
+                        self.bids.levels.remove(&fill_price);
+                        self.bids.price_index.remove(&fill_price);
+                        if self.bids.best_price == Some(fill_price) {
+                            self.bids.update_best_price();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6) Splice the sweep's freed chain into the slab freelist. One write
+        //    to the chain tail's `next`, one update to `free_head`.
+        if let Some(tail) = freed_chain_tail {
+            let head = freed_chain_head.expect("invariant: head ⇒ tail");
+            self.slab.slots[tail.0 as usize].next = self.slab.free_head;
+            self.slab.free_head = Some(head);
         }
 
         Ok(remaining)
@@ -215,9 +353,9 @@ impl<C: FillConsumer> OrderBook<C> {
         Ok(())
     }
 
-    // (3) Removes order index map
-    // (2) Updates price limit and links
-    // (1) Inserts order in slab
+    // (1) Lookup + remove from order_index
+    // (2) Unlink from price level (stitch prev/next, drop level if empty)
+    // (3) Return slot to freelist
     pub fn cancel_limit_order(&mut self, order_id: OrderId) -> BookResult<()> {
         let (idx, side, price) = self
             .order_index
@@ -339,35 +477,6 @@ impl HalfBook {
                     self.update_best_price();
                 };
             }
-        }
-    }
-
-    /// (1) Update price level and stich slab links
-    /// (2) Remove price level if empty (-price_index)
-    /// (3) Refresh best price
-    fn pop_order_from_l2_book_and_update_slab_links(
-        &mut self,
-        price: Price,
-        slab: &mut OrderSlab,
-    ) -> BookResult<SlabIndex> {
-        if let Some(level) = self.levels.get_mut(&price) {
-            let removed_idx = level
-                .pop_order_from_l2_level_and_update_slab_links(slab)
-                .ok_or(BookError::EmptyLevel)?;
-
-            if level.is_empty() {
-                self.levels.remove(&price);
-                self.price_index.remove(&price);
-
-                // Refresh the best price if needed
-                if self.best_price == Some(price) {
-                    self.update_best_price();
-                };
-            }
-
-            Ok(removed_idx)
-        } else {
-            return Err(BookError::MissingLevel);
         }
     }
 
@@ -499,37 +608,18 @@ impl PriceLevel {
         self.quantity += slab.get(idx).quantity;
         self.order_count += 1;
     }
-
-    /// Remove the front order from the queue. O(1).
-    /// Returns the SlabIndex of the removed order.
-    pub fn pop_order_from_l2_level_and_update_slab_links(
-        &mut self,
-        slab: &mut OrderSlab,
-    ) -> Option<SlabIndex> {
-        let head_idx = self.head?;
-        let next = slab.get(head_idx).next;
-
-        if let Some(next_idx) = next {
-            // We informe the next order slot that the previous
-            // order slot is now free
-            slab.get_mut(next_idx).prev = None;
-        } else {
-            // If there is no next slot then it means the order queue is empty
-            self.tail = None;
-        };
-        self.head = next;
-
-        self.quantity -= slab.get(head_idx).quantity;
-        self.order_count -= 1;
-
-        Some(head_idx)
-    }
 }
 
-/// The slab allocator.
+/// Slab allocator with no per-slot discriminant.
+///
+/// Slots store `Order` directly. When a slot is on the freelist, its
+/// `Order.next` field is repurposed as the freelist link; the other fields
+/// (`order_id`, `price`, `quantity`, `side`, `prev`) are garbage. Callers
+/// must not read a free slot — invariant maintained by the matcher and by
+/// `order_index` only holding indices of occupied slots.
 pub struct OrderSlab {
-    slots: Vec<OrderSlot>,
-    free_head: Option<u32>, // head of the free list
+    slots: Vec<Order>,
+    free_head: Option<SlabIndex>,
     capacity: usize,
 }
 
@@ -538,69 +628,60 @@ impl OrderSlab {
         assert!(capacity > 0, "slab capacity must be non-zero");
 
         let mut slots = Vec::with_capacity(capacity);
-
         for i in 0..capacity {
             let next_free = if i + 1 < capacity {
-                Some((i + 1) as u32)
+                Some(SlabIndex((i + 1) as u32))
             } else {
                 None
             };
-            slots.push(OrderSlot::Free { next_free })
+            // Placeholder `Order` — only `next` (the freelist link) is
+            // meaningful while the slot is free.
+            // TODO: init through Default trait, but we need to remove the side first
+            slots.push(Order {
+                order_id: OrderId(0),
+                price: Price(0),
+                quantity: 0,
+                side: Side::Bid,
+                prev: None,
+                next: next_free,
+            });
         }
 
         Self {
             slots,
-            free_head: Some(0),
+            free_head: Some(SlabIndex(0)),
             capacity,
         }
     }
 
+    #[inline(always)]
     pub fn get(&self, idx: SlabIndex) -> &Order {
-        match &self.slots[idx.0 as usize] {
-            OrderSlot::Occupied(order) => order,
-            OrderSlot::Free { .. } => panic!("get() on free slot {:?}", idx),
-        }
+        &self.slots[idx.0 as usize]
     }
 
+    #[inline(always)]
     pub fn get_mut(&mut self, idx: SlabIndex) -> &mut Order {
-        match &mut self.slots[idx.0 as usize] {
-            OrderSlot::Occupied(order) => order,
-            OrderSlot::Free { .. } => panic!("get_mut() on free slot {:?}", idx),
-        }
+        &mut self.slots[idx.0 as usize]
     }
 
     pub fn free(&mut self, idx: SlabIndex) {
-        let old_head = self.free_head;
-        self.slots[idx.0 as usize] = OrderSlot::Free {
-            next_free: old_head,
-        };
-        self.free_head = Some(idx.0);
+        self.slots[idx.0 as usize].next = self.free_head;
+        self.free_head = Some(idx);
     }
 
     pub fn insert_order(&mut self, order: Order) -> BookResult<SlabIndex> {
-        if let Some(idx) = self.free_head {
-            let slot = &self.slots[idx as usize];
-
-            // This is the type of error catching we want to find in exhaustive testing
-            // but eliminate it out of prod code
-            self.free_head = match slot {
-                OrderSlot::Free { next_free } => *next_free,
-                OrderSlot::Occupied(_) => unreachable!("free list points to occupied slot"),
-            };
-
-            self.slots[idx as usize] = OrderSlot::Occupied(order);
-            Ok(SlabIndex(idx))
-        } else {
-            return Err(BookError::SlabFull);
-        }
+        let idx = self.free_head.ok_or(BookError::SlabFull)?;
+        // The slot's `next` field holds the freelist link while free; read it
+        // before we overwrite the slot with the caller's `Order`.
+        let next_free = self.slots[idx.0 as usize].next;
+        self.free_head = next_free;
+        self.slots[idx.0 as usize] = order;
+        Ok(idx)
     }
-}
 
-/// A slot in the slab — either occupied or free (part of free list).
-#[derive(Debug)]
-enum OrderSlot {
-    Occupied(Order),
-    Free { next_free: Option<u32> }, // index of next free slot
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 /// A resting limit order.
