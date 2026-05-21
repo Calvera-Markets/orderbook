@@ -1,4 +1,3 @@
-use anyhow::{Result, anyhow};
 /// Optimizations:
 /// (1) Instead of using VECs:
 /// - A simple array can't be used because it would blow the stack
@@ -29,6 +28,8 @@ use anyhow::{Result, anyhow};
 /// (3) There is some degree of cross-referentiality in our data structures. Instead of using indices
 /// we should use pointers.
 use std::collections::{BTreeSet, HashMap};
+
+use crate::errors::{BookError, BookResult};
 
 pub struct OrderBook<C: FillConsumer> {
     bids: HalfBook,
@@ -90,7 +91,7 @@ impl<C: FillConsumer> OrderBook<C> {
         side: Side,
         price_limit: Option<Price>,
         quantity: u64,
-    ) -> Result<u64> {
+    ) -> BookResult<u64> {
         let mut remaining = quantity;
 
         while remaining > 0 {
@@ -182,7 +183,7 @@ impl<C: FillConsumer> OrderBook<C> {
         side: Side,
         price: Price,
         quantity: u64,
-    ) -> Result<()> {
+    ) -> BookResult<()> {
         // Limit semantics: stop matching when price no longer crosses.
         let remaining = self.match_against_opposite(side, Some(price), quantity)?;
 
@@ -217,11 +218,11 @@ impl<C: FillConsumer> OrderBook<C> {
     // (3) Removes order index map
     // (2) Updates price limit and links
     // (1) Inserts order in slab
-    pub fn cancel_limit_order(&mut self, order_id: OrderId) -> Result<()> {
+    pub fn cancel_limit_order(&mut self, order_id: OrderId) -> BookResult<()> {
         let (idx, side, price) = self
             .order_index
             .remove(&order_id)
-            .ok_or_else(|| anyhow!("Order not found"))?;
+            .ok_or(BookError::OrderNotFound)?;
 
         match side {
             Side::Bid => self.bids.remove_order_from_l2_book_and_update_slab_links(
@@ -248,7 +249,7 @@ impl<C: FillConsumer> OrderBook<C> {
         side: Side,
         quantity: u64,
         mode: MarketOrderMode,
-    ) -> Result<MarketOrderResult> {
+    ) -> BookResult<MarketOrderResult> {
         // NOTE: Considering the frquency of this happenening, it
         // seems like a big price to pay to run this upfront. I think the
         // best is to actually let it fail iteratively as it tries to fill
@@ -346,11 +347,11 @@ impl HalfBook {
         &mut self,
         price: Price,
         slab: &mut OrderSlab,
-    ) -> Result<SlabIndex> {
+    ) -> BookResult<SlabIndex> {
         if let Some(level) = self.levels.get_mut(&price) {
             let removed_idx = level
                 .pop_order_from_l2_level_and_update_slab_links(slab)
-                .ok_or_else(|| anyhow!("No order to pop?"))?;
+                .ok_or(BookError::EmptyLevel)?;
 
             if level.is_empty() {
                 self.levels.remove(&price);
@@ -364,7 +365,7 @@ impl HalfBook {
 
             Ok(removed_idx)
         } else {
-            return Err(anyhow!("No price level found, whaaat"));
+            return Err(BookError::MissingLevel);
         }
     }
 
@@ -574,7 +575,7 @@ impl OrderSlab {
         self.free_head = Some(idx.0);
     }
 
-    pub fn insert_order(&mut self, order: Order) -> Result<SlabIndex> {
+    pub fn insert_order(&mut self, order: Order) -> BookResult<SlabIndex> {
         if let Some(idx) = self.free_head {
             let slot = &self.slots[idx as usize];
 
@@ -588,7 +589,7 @@ impl OrderSlab {
             self.slots[idx as usize] = OrderSlot::Occupied(order);
             Ok(SlabIndex(idx))
         } else {
-            return Err(anyhow!("Slab is full"));
+            return Err(BookError::SlabFull);
         }
     }
 }
