@@ -28,6 +28,8 @@
 /// (3) There is some degree of cross-referentiality in our data structures. Instead of using indices
 /// we should use pointers.
 use std::collections::{BTreeSet, HashMap};
+// TODO: Consider using sentinel u32::MAX instead of Zero, that way we avoid dead slot at i=0
+use std::num::NonZeroU32;
 
 use crate::errors::{BookError, BookResult};
 
@@ -161,7 +163,7 @@ impl<C: FillConsumer> OrderBook<C> {
                     // Read everything we need from the slot in one shot. After
                     // this we either fully consume (no slab write in this iter)
                     // or partially consume (one slab write at the end).
-                    let slot = &self.slab.slots[current_idx.0 as usize];
+                    let slot = &self.slab.slots[current_idx.as_usize()];
                     let resting_qty = slot.quantity;
                     let resting_id = slot.order_id;
                     let next_idx = slot.next;
@@ -191,7 +193,7 @@ impl<C: FillConsumer> OrderBook<C> {
                                     // its stale `prev` (was pointing at the
                                     // now-freed `current_idx`) and settle
                                     // level counters once.
-                                    self.slab.slots[n.0 as usize].prev = None;
+                                    self.slab.slots[n.as_usize()].prev = None;
                                     level.head = Some(n);
                                     level.quantity -= consumed_qty;
                                     level.order_count -= consumed_count;
@@ -217,7 +219,7 @@ impl<C: FillConsumer> OrderBook<C> {
                         // new head; its `prev` may still point to a now-freed
                         // slot, so clear it unconditionally (cheaper than
                         // branching on whether anything was freed earlier).
-                        let s = &mut self.slab.slots[current_idx.0 as usize];
+                        let s = &mut self.slab.slots[current_idx.as_usize()];
                         s.quantity -= fill_qty;
                         s.prev = None;
                         consumed_qty += fill_qty;
@@ -242,7 +244,7 @@ impl<C: FillConsumer> OrderBook<C> {
             if let Some((lf_head, lf_tail)) = level_freed {
                 match freed_chain_tail {
                     Some(prev_tail) => {
-                        self.slab.slots[prev_tail.0 as usize].next = Some(lf_head);
+                        self.slab.slots[prev_tail.as_usize()].next = Some(lf_head);
                     }
                     None => {
                         freed_chain_head = Some(lf_head);
@@ -276,7 +278,7 @@ impl<C: FillConsumer> OrderBook<C> {
         //    to the chain tail's `next`, one update to `free_head`.
         if let Some(tail) = freed_chain_tail {
             let head = freed_chain_head.expect("invariant: head ⇒ tail");
-            self.slab.slots[tail.0 as usize].next = self.slab.free_head;
+            self.slab.slots[tail.as_usize()].next = self.slab.free_head;
             self.slab.free_head = Some(head);
         }
 
@@ -299,15 +301,13 @@ impl<C: FillConsumer> OrderBook<C> {
         let remaining = self.match_against_opposite(side, Some(price), quantity)?;
 
         if remaining > 0 {
-            let new_order = Order {
-                order_id,
-                price,
-                quantity: remaining,
-                prev: None,
-                next: None,
-            };
-
-            let order_idx = self.slab.insert_order(new_order)?;
+            let order_idx = self.slab.alloc_slot()?;
+            let slot = self.slab.get_mut(order_idx);
+            slot.order_id = order_id;
+            slot.price = price;
+            slot.quantity = remaining;
+            slot.prev = None;
+            slot.next = None;
 
             match side {
                 Side::Ask => self
@@ -599,16 +599,28 @@ impl OrderSlab {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "slab capacity must be non-zero");
 
-        let mut slots = Vec::with_capacity(capacity);
-        for i in 0..capacity {
-            let next_free = if i + 1 < capacity {
-                Some(SlabIndex((i + 1) as u32))
+        let total_slots = capacity + 1;
+        let mut slots = Vec::with_capacity(total_slots);
+
+        // slots[0]: reserved sentinel slot, never reachable from any
+        // SlabIndex.
+        slots.push(Order {
+            order_id: OrderId(0),
+            price: Price(0),
+            quantity: 0,
+            prev: None,
+            next: None,
+        });
+
+        // slots[1..=capacity]: freelist 1 -> 2 -> … -> capacity -> None.
+        for i in 1..=capacity {
+            let next_free = if i < capacity {
+                Some(SlabIndex::new((i + 1) as u32))
             } else {
                 None
             };
             // Placeholder `Order` — only `next` (the freelist link) is
             // meaningful while the slot is free.
-            // TODO: init through Default trait
             slots.push(Order {
                 order_id: OrderId(0),
                 price: Price(0),
@@ -620,33 +632,37 @@ impl OrderSlab {
 
         Self {
             slots,
-            free_head: Some(SlabIndex(0)),
+            free_head: Some(SlabIndex::new(1)),
             capacity,
         }
     }
 
     #[inline(always)]
     pub fn get(&self, idx: SlabIndex) -> &Order {
-        &self.slots[idx.0 as usize]
+        &self.slots[idx.as_usize()]
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, idx: SlabIndex) -> &mut Order {
-        &mut self.slots[idx.0 as usize]
+        &mut self.slots[idx.as_usize()]
     }
 
     pub fn free(&mut self, idx: SlabIndex) {
-        self.slots[idx.0 as usize].next = self.free_head;
+        self.slots[idx.as_usize()].next = self.free_head;
         self.free_head = Some(idx);
     }
 
-    pub fn insert_order(&mut self, order: Order) -> BookResult<SlabIndex> {
+    /// Claim a slot from the freelist. Returns its `SlabIndex`. The slot's
+    /// fields are left as-is from the previous occupant (or the default
+    /// for slots never yet used); the caller MUST overwrite every field
+    /// (`order_id`, `price`, `quantity`, `prev`, `next`) via `get_mut`
+    /// before any other code reads the slot.
+    pub fn alloc_slot(&mut self) -> BookResult<SlabIndex> {
         let idx = self.free_head.ok_or(BookError::SlabFull)?;
-        // The slot's `next` field holds the freelist link while free; read it
-        // before we overwrite the slot with the caller's `Order`.
-        let next_free = self.slots[idx.0 as usize].next;
+        // The slot's `next` field holds the freelist link while free; read
+        // it before the caller overwrites the slot.
+        let next_free = self.slots[idx.as_usize()].next;
         self.free_head = next_free;
-        self.slots[idx.0 as usize] = order;
         Ok(idx)
     }
 
@@ -656,6 +672,15 @@ impl OrderSlab {
 }
 
 /// A resting limit order.
+///
+/// Mechanical Sympathy: Layout is exactly 32 bytes
+/// With 64 B cache lines that means two `Order`s per line.
+///
+/// `#[repr(C, align(32))]` pins both the field layout and the struct
+/// alignment to 32, so a `Vec<Order>` is guaranteed to start at a 32-byte
+/// boundary and every random index lands in exactly one cache line — no
+/// straddle, regardless of `Vec` size or allocator. No padding needed
+#[repr(C, align(32))]
 #[derive(Debug, Clone)]
 pub struct Order {
     pub order_id: OrderId,
@@ -677,9 +702,33 @@ pub enum Side {
     Ask,
 }
 
-/// Index into the slab — this is what we store instead of Box<Order>.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlabIndex(pub u32);
+/// Index into the slab.
+///
+/// Wraps `NonZeroU32` so the compiler can niche-optimise `Option<SlabIndex>`
+/// to 4 bytes — `0` becomes the `None` bit pattern. Without this, the
+/// `Option` discriminant + alignment padding would cost an extra 4 bytes
+/// per field, blowing `Order` past the 32-byte cache-line-friendly size.
+///
+/// The slab reserves index 0 (allocates `capacity + 1` slots and leaves
+/// `slots[0]` permanently unused) so the constraint that `SlabIndex(0)`
+/// cannot exist is invisible to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlabIndex(pub NonZeroU32);
+
+impl SlabIndex {
+    /// Construct a `SlabIndex` from a raw `u32`. Panics if `n == 0`.
+    /// Use in cold setup paths — the matcher only consumes pre-built
+    /// indices and never calls this on a hot loop iteration.
+    #[inline]
+    pub fn new(n: u32) -> Self {
+        Self(NonZeroU32::new(n).expect("SlabIndex(0) is reserved (niche-optimisation sentinel)"))
+    }
+
+    #[inline(always)]
+    pub fn as_usize(self) -> usize {
+        self.0.get() as usize
+    }
+}
 
 #[derive(Debug)]
 pub struct MarketOrderResult {
