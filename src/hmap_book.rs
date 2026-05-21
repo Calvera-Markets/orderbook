@@ -27,33 +27,6 @@
 ///
 /// (3) There is some degree of cross-referentiality in our data structures. Instead of using indices
 /// we should use pointers.
-
-//! 1. **No `OrderSlot` enum.** The slab stores `Order` directly. When a slot is
-//!    on the freelist, its `Order.next` field is repurposed as the freelist
-//!    link; the other `Order` fields are garbage and must not be read. Drops
-//!    the 8-byte discriminant + alignment from every slot.
-//!
-//! 2. **Per-level batched matching.** `match_against_opposite` looks the
-//!    `PriceLevel` up once per level (not once per fill), walks the FIFO via
-//!    `Order.next` reads only, and updates `level.{quantity, order_count,
-//!    head}` exactly once when leaving the level — instead of once per
-//!    consumed order.
-//!
-//! 3. **Bulk slab free.** Fully-consumed orders are *not* returned to the
-//!    freelist one-at-a-time. The level's existing FIFO chain (already linked
-//!    via `Order.next`) is the freed chain; across multiple drained levels in
-//!    one sweep, the per-level chains are stitched with a single write per
-//!    level boundary. At end-of-sweep the whole chain is spliced into
-//!    `free_head` with one more write. Slab writes during a sweep go from
-//!    O(consumed orders) to O(level boundaries).
-//!
-//! 4. **Bug-fix carryover.** `cancel_limit_order` now calls `slab.free` after
-//!    unlinking — v1 leaked the slot.
-//!
-//! What did NOT change: FOK pre-scan (still O(levels)), the `match side` arms
-//! threaded through the hot path, and the `HashMap<OrderId, …>` order index.
-//! All separately discussed; out of scope for this change.
-
 use std::collections::{BTreeSet, HashMap};
 
 use crate::errors::{BookError, BookResult};
