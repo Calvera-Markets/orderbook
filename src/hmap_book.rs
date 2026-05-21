@@ -235,7 +235,9 @@ impl<C: FillConsumer> OrderBook<C> {
                 price,
                 &mut self.slab,
             ),
-        }
+        };
+
+        self.slab.free(idx);
 
         Ok(())
     }
