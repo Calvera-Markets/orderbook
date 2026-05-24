@@ -49,6 +49,24 @@ benches *FLAGS:
      echo "→ logging to $LOG"; \
      cargo bench -p calvera-books --bench hmap_book -- {{FLAGS}} 2>&1 | tee "$LOG"
 
+# v2 benches: same workloads but matcher publishes fills into a Calvera
+# Disruptor (cross-thread SPSC ring) instead of pushing into a Vec<Fill>.
+# See benches/hmap_book_disruptor.rs.
+benches-disruptor *FLAGS:
+    @mkdir -p benches/logs
+    @LOG="benches/logs/bench-disruptor-$(date +%Y%m%d-%H%M%S).log"; \
+     echo "→ logging to $LOG"; \
+     cargo bench -p calvera-books --bench hmap_book_disruptor -- {{FLAGS}} 2>&1 | tee "$LOG"
+
+# v3 benches: matcher buffers fills per-operation and emits them via one
+# `batch_publish` at the end of each operation. Amortizes Disruptor slot-
+# claim cost across all fills in an op. See benches/hmap_book_disruptor_batched.rs.
+benches-disruptor-batched *FLAGS:
+    @mkdir -p benches/logs
+    @LOG="benches/logs/bench-disruptor-batched-$(date +%Y%m%d-%H%M%S).log"; \
+     echo "→ logging to $LOG"; \
+     cargo bench -p calvera-books --bench hmap_book_disruptor_batched -- {{FLAGS}} 2>&1 | tee "$LOG"
+
 # Run a single bench by name. Example: just bench-one limit_rest/single_level
 bench-one NAME *FLAGS:
     @mkdir -p benches/logs
