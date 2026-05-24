@@ -1,32 +1,3 @@
-/// Optimizations:
-/// (1) Instead of using VECs:
-/// - A simple array can't be used because it would blow the stack
-///
-/// - mmap with MAP_HUGETLB. Instead of Vec or a static array, you allocate directly
-/// from the OS using huge pages (2MB or 1GB pages instead of 4KB). This keeps the entire
-/// slab in a small number of TLB entries, dramatically reducing TLB pressure when you're
-/// scanning lots of orders. The allocation is still heap-like (it's a pointer), but the memory
-/// is physically contiguous and huge-page-backed:
-/// rust// pseudocode — real impl `uses libc::mmap`
-/// ```rust
-/// let ptr = mmap(size, MAP_ANONYMOUS | MAP_HUGETLB);
-/// let slab: &mut [OrderSlot] = slice::from_raw_parts_mut(ptr, capacity
-/// ```
-///
-/// - LMAX approach: declare the entire engine state as a single large struct, allocate it once with a custom allocator pinned to a NUMA node, and never move it. The "slab" is just a field in that struct. In Rust this looks like using #[repr(C)] with explicit field ordering to control cache line layout.
-///
-/// The pointer indirection of Vec costs maybe 1-2 cycles on a cache-warm access. What actually kills you at HFT latency is:
-///
-/// Cache misses when the order you're accessing is cold (not recently touched)
-/// TLB misses when your slab spans thousands of 4KB pages
-/// False sharing when two CPU cores write to slots in the same cache line
-/// None of those are solved by switching from Vec to an array. They're solved by huge pages, NUMA-aware allocation, and cache-line padding between slots that different threads touch.
-///
-/// (2) Branchless programming, instead of pattern matching on trade side, maybe we can just
-/// rely on arithmetic
-///
-/// (3) There is some degree of cross-referentiality in our data structures. Instead of using indices
-/// we should use pointers.
 use std::collections::{BTreeSet, HashMap};
 // TODO: Consider using sentinel u32::MAX instead of Zero, that way we avoid dead slot at i=0
 use std::num::NonZeroU32;
@@ -34,6 +5,8 @@ use std::num::NonZeroU32;
 use crate::errors::{BookError, BookResult};
 
 pub struct OrderBook<C: FillConsumer> {
+    // compiler's existing cmov-style dispatch on the match side arms
+    // has better perf than [HalfBook; 2]
     bids: HalfBook,
     asks: HalfBook,
     slab: OrderSlab,
