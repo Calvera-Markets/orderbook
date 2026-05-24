@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 // TODO: Consider using sentinel u32::MAX instead of Zero, that way we avoid dead slot at i=0
 use std::num::NonZeroU32;
 
 use crate::errors::{BookError, BookResult};
+use crate::u64_map::U64Map;
 
 pub struct OrderBook<C: FillConsumer> {
     // compiler's existing cmov-style dispatch on the match side arms
@@ -12,7 +13,7 @@ pub struct OrderBook<C: FillConsumer> {
     slab: OrderSlab,
     /// order_id → (SlabIndex, Side, Price)
     /// Required for O(1) cancel without scanning the book.
-    order_index: HashMap<OrderId, (SlabIndex, Side, Price)>,
+    order_index: U64Map<OrderId, (SlabIndex, Side, Price)>,
     /// Fill sink. Bound at the type level — `C` is chosen by the binary that
     /// constructs the `OrderBook`. The matcher calls `consumer.on_fill(...)`
     /// once per fill; because `C` is a concrete type and `on_fill` is
@@ -45,7 +46,7 @@ impl<C: FillConsumer> OrderBook<C> {
             bids: HalfBook::new(Side::Bid),
             asks: HalfBook::new(Side::Ask),
             slab: OrderSlab::with_capacity(slab_capacity),
-            order_index: HashMap::with_capacity(slab_capacity),
+            order_index: U64Map::with_capacity_and_hasher(slab_capacity, Default::default()),
             consumer,
         }
     }
@@ -378,7 +379,7 @@ impl<C: FillConsumer> OrderBook<C> {
 
 pub struct HalfBook {
     side: Side,
-    levels: HashMap<Price, PriceLevel>,
+    levels: U64Map<Price, PriceLevel>,
     price_index: BTreeSet<Price>, // sorted; only walked on level drain
     best_price: Option<Price>,
 }
@@ -387,7 +388,7 @@ impl HalfBook {
     fn new(side: Side) -> Self {
         Self {
             side,
-            levels: HashMap::new(),
+            levels: U64Map::default(),
             price_index: BTreeSet::new(),
             best_price: None,
         }

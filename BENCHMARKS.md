@@ -1,110 +1,69 @@
 # calvera-books — Benchmarks
 
-Numbers for the `hmap_book::OrderBook` implementation, collected with criterion
-0.8 (`cargo bench -p calvera-books --bench hmap_book`).
+Numbers for the `OrderBook` implementation, collected with criterion 0.8. The
+"current" column tracks the latest version (v0.0.5 — see [`CHANGELOG.md`](CHANGELOG.md)
+for the per-version code/perf walkthrough).
 
 All times below are the **median** of a 100-sample run. Each iteration runs
 against a fresh book (criterion's `iter_batched`), so setup time is excluded
 from the measurement.
 
-## Current baseline
+## Current baseline (v0.0.5)
 
-Bench harness: `benches/hmap_book.rs`. Slab capacity: 1 MiB (`SLAB_CAP = 1 <<
-20`). Consumer: `VecConsumer` (appends every fill to a `Vec<Fill>`).
+Bench harness: `benches/hmap_book_2.rs` (`cargo bench -p calvera-books --bench
+hmap_book_2`). Slab capacity: 1 MiB (`SLAB_CAP = 1 << 20`). Consumer:
+`VecConsumer` (appends every fill to a `Vec<Fill>`).
 
 | Benchmark                          | Median    | Per-element / per-level    |
 | ---------------------------------- | --------- | -------------------------- |
-| `limit_rest/single_level`          | 1.91 µs   | one insert, empty book     |
-| `limit_rest/spread_levels`         | 2.43 µs   | one insert, 1000-level book |
-| `limit_match_single/full_consume`  | 109 ns    | one full-consume match     |
-| `limit_sweep_levels/4`             | 211 ns    | ~53 ns / level             |
-| `limit_sweep_levels/16`            | 1.01 µs   | ~63 ns / level             |
-| `limit_sweep_levels/64`            | 4.11 µs   | ~64 ns / level             |
-| `limit_sweep_levels/256`           | 17.51 µs  | ~68 ns / level             |
-| `market_sweep/4`                   | 213 ns    | ~53 ns / level             |
-| `market_sweep/16`                  | 1.06 µs   | ~66 ns / level             |
-| `market_sweep/64`                  | 4.10 µs   | ~64 ns / level             |
-| `market_sweep/256`                 | 17.86 µs  | ~70 ns / level             |
-| `market_sweep_opl/L256xO1`         | 17.64 µs  | ~69 ns / fill (OPL=1)      |
-| `market_sweep_opl/L64xO4`          | 7.57 µs   | ~30 ns / fill (OPL=4)      |
-| `market_sweep_opl/L16xO16`         | 5.10 µs   | ~20 ns / fill (OPL=16)     |
-| `market_sweep_opl/L4xO64`          | 4.51 µs   | ~18 ns / fill (OPL=64)     |
-| `cancel/mid_book`                  | 81 ns     | O(1) cancel                |
-| `mixed_workload/random_add_cancel` | 27.51 µs  | ~27 ns / op (1024 ops)     |
+| `limit_rest/single_level`          | 101 ns    | one insert, empty book     |
+| `limit_rest/spread_levels`         | 106 ns    | one insert, 1000-level book |
+| `limit_match_single/full_consume`  | 82.5 ns   | one full-consume match     |
+| `limit_sweep_levels/4`             | 133 ns    | ~33 ns / level             |
+| `limit_sweep_levels/16`            | 574 ns    | ~36 ns / level             |
+| `limit_sweep_levels/64`            | 2.00 µs   | ~31 ns / level             |
+| `limit_sweep_levels/256`           | 9.31 µs   | ~36 ns / level             |
+| `market_sweep/4`                   | 133 ns    | ~33 ns / level             |
+| `market_sweep/16`                  | 627 ns    | ~39 ns / level             |
+| `market_sweep/64`                  | 2.14 µs   | ~33 ns / level             |
+| `market_sweep/256`                 | 9.59 µs   | ~37 ns / level             |
+| `market_sweep_opl/L256xO1`         | 9.52 µs   | ~37 ns / fill (OPL=1)      |
+| `market_sweep_opl/L64xO4`          | 3.42 µs   | ~13 ns / fill (OPL=4)      |
+| `market_sweep_opl/L16xO16`         | 2.14 µs   | ~8.3 ns / fill (OPL=16)    |
+| `market_sweep_opl/L4xO64`          | 1.79 µs   | ~7.0 ns / fill (OPL=64)    |
+| `cancel/mid_book`                  | 42 ns     | O(1) cancel                |
+| `mixed_workload/random_add_cancel` | 9.72 µs   | ~9.5 ns / op (1024 ops)    |
 
-## Improvement journey vs the original v1 implementation
+## v0.0.1 → v0.0.5
 
-Three rounds of changes happened in sequence. The deltas below compare each
-final-state number to the v1 baseline (same machine, same session, identical
-bench harness).
+Initial implementation against latest. Same machine, identical bench harness,
+`VecConsumer` on both sides. Per-version detail (what each step changed and
+why) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
-| Benchmark                          | v1        | Current  | Δ        |
+| Benchmark                          | v0.0.1    | v0.0.5   | Δ        |
 | ---------------------------------- | --------- | -------- | -------- |
-| `limit_rest/single_level`          | 2.84 µs   | 1.91 µs  | **−33%** |
-| `limit_rest/spread_levels`         | 2.74 µs   | 2.43 µs  | **−11%** |
-| `limit_match_single/full_consume`  | 244 ns    | 109 ns   | **−55%** |
-| `limit_sweep_levels/4`             | 345 ns    | 211 ns   | **−39%** |
-| `limit_sweep_levels/16`            | 1.34 µs   | 1.01 µs  | **−25%** |
-| `limit_sweep_levels/64`            | 5.49 µs   | 4.11 µs  | **−25%** |
-| `limit_sweep_levels/256`           | 21.67 µs  | 17.51 µs | **−19%** |
-| `market_sweep/4`                   | 343 ns    | 213 ns   | **−38%** |
-| `market_sweep/16`                  | 1.36 µs   | 1.06 µs  | **−22%** |
-| `market_sweep/64`                  | 5.47 µs   | 4.10 µs  | **−25%** |
-| `market_sweep/256`                 | 21.83 µs  | 17.86 µs | **−18%** |
-| `market_sweep_opl/L256xO1`         | 21.78 µs  | 17.64 µs | **−19%** |
-| `market_sweep_opl/L64xO4`          | 15.90 µs  | 7.57 µs  | **−52%** |
-| `market_sweep_opl/L16xO16`         | 13.37 µs  | 5.10 µs  | **−62%** |
-| `market_sweep_opl/L4xO64`          | 12.20 µs  | 4.51 µs  | **−63%** |
-| `cancel/mid_book` *(see note)*     | 127 ns    | 81 ns    | **−36%** |
-| `mixed_workload/random_add_cancel` | 47.92 µs  | 27.51 µs | **−43%** |
+| `limit_rest/single_level`          | 2.84 µs   | 101 ns   | **−96%** |
+| `limit_rest/spread_levels`         | 2.74 µs   | 106 ns   | **−96%** |
+| `limit_match_single/full_consume`  | 244 ns    | 82.5 ns  | **−66%** |
+| `limit_sweep_levels/4`             | 345 ns    | 133 ns   | **−61%** |
+| `limit_sweep_levels/16`            | 1.34 µs   | 574 ns   | **−57%** |
+| `limit_sweep_levels/64`            | 5.49 µs   | 2.00 µs  | **−63%** |
+| `limit_sweep_levels/256`           | 21.67 µs  | 9.31 µs  | **−57%** |
+| `market_sweep/4`                   | 343 ns    | 133 ns   | **−61%** |
+| `market_sweep/16`                  | 1.36 µs   | 627 ns   | **−54%** |
+| `market_sweep/64`                  | 5.47 µs   | 2.14 µs  | **−61%** |
+| `market_sweep/256`                 | 21.83 µs  | 9.59 µs  | **−56%** |
+| `market_sweep_opl/L256xO1`         | 21.78 µs  | 9.52 µs  | **−56%** |
+| `market_sweep_opl/L64xO4`          | 15.90 µs  | 3.42 µs  | **−79%** |
+| `market_sweep_opl/L16xO16`         | 13.37 µs  | 2.14 µs  | **−84%** |
+| `market_sweep_opl/L4xO64`          | 12.20 µs  | 1.79 µs  | **−85%** |
+| `cancel/mid_book` *(see note)*     | 127 ns    | 42 ns    | **−67%** |
+| `mixed_workload/random_add_cancel` | 47.92 µs  | 9.72 µs  | **−80%** |
 
-*Note on `cancel/mid_book`*: the v1 number above (127 ns) is **correct v1**,
-i.e. with the slab-slot leak fixed — when v1 actually frees the slot on
-cancel. Pre-fix v1 reported 91 ns because it was skipping `slab.free`
-(the slot was leaked), so it was doing strictly less work than v2.
-
-### What each round did
-
-1. **Matcher refactor + cancel slot-leak fix** (commits `0c5aca5` and `226b71e`).
-   - Restructured `match_against_opposite` into outer sweep + inner per-level
-     walk; cache the `PriceLevel` once per level instead of once per fill.
-   - Bulk-free fully-consumed orders via the existing FIFO chain (one slab
-     write per level boundary + one splice at end-of-sweep), eliminating the
-     per-fill `slab.free`.
-   - Drop the `OrderSlot` enum tag; slab is now `Vec<Order>` with the freelist
-     threaded through `Order.next` of free slots.
-   - Fix the v1 cancel slot-leak (`slab.free` was never called).
-   - **Where the wins land:** OPL-batched sweeps (40–55% on `market_sweep_opl`),
-     because the per-level work now amortises over many fills.
-
-2. **`NonZeroU32` + `#[repr(C, align(32))]` on `Order`**.
-   - Wrap `SlabIndex(u32)` → `SlabIndex(NonZeroU32)`. Niche-optimised
-     `Option<SlabIndex>` shrinks from 8 → 4 bytes (free `None` bit pattern at
-     0); the slab reserves slot 0 to honour the non-zero invariant.
-   - Shrinks `Order` from 40 B → 32 B exactly (8 + 8 + 8 + 4 + 4).
-   - `#[repr(align(32))]` guarantees two slots per 64 B cache line, no straddle
-     on random access regardless of allocator behaviour or slab size.
-   - **Where the wins land:** double-digit reductions on every workload with a
-     non-trivial cache footprint (~9–17% on deep sweeps, ~22% on cancel,
-     ~29% on the mixed workload).
-
-3. **`alloc_slot` instead of `insert_order(Order)`**.
-   - The 32 B alignment on `Order` was forcing the compiler to align the
-     stack frame to 32 in any function that builds an `Order` literal — adding
-     a `sub` + `and sp, …` pair to `add_limit_order`'s prologue, paid on every
-     call.
-   - Replaced `insert_order(order: Order)` (which took the Order by value)
-     with `alloc_slot() -> SlabIndex` + direct field writes through
-     `get_mut`. The slab buffer is already 32-aligned, so the caller never
-     constructs an `Order` on the stack.
-   - The two saved prologue instructions are themselves only ~0.7 ns, but
-     they were a *trigger* for cascading codegen pessimism — eliminating
-     them shrunk the function's stack frame from 256 → 192 B and unlocked
-     better register allocation and instruction scheduling through the rest
-     of `add_limit_order`.
-   - **Where the wins land:** very large reductions at shallow sweep depths
-     (`/4` sweeps roughly halved) and ~10–25% on every other shape that goes
-     through `add_limit_order`.
+*Note on `cancel/mid_book`*: the v0.0.1 number (127 ns) is **with the slab-slot
+leak fixed** — pre-fix v0.0.1 reported 91 ns because it was skipping
+`slab.free` (the slot was leaked), so it was doing strictly less work. The
+fix landed in v0.0.2.
 
 ## What each bench measures
 
@@ -138,7 +97,7 @@ the asks and qty=N — so it walks every ask level, fully consuming each one in
 turn.
 
 This is the **primary throughput benchmark for the matching loop**. Per-level
-cost trends from ~53 ns at /4 toward ~68 ns at /256 — the higher levels pay
+cost trends from ~33 ns at /4 to ~36 ns at /256 — the higher levels pay
 slightly more in TLB / L1 pressure as the working set grows.
 
 ### `market_sweep/{4,16,64,256}`
@@ -156,9 +115,9 @@ level. At OPL=1 every "level walk" runs a single fill then drains; at OPL=64 a
 single level walk consumes 64 fills under one hashmap lookup, one
 level-bookkeeping update, and one freelist stitch.
 
-The drop from `L256xO1` (17.6 µs) to `L4xO64` (4.5 µs) — same total work,
-quarter the wall-clock — is the headline payoff of the per-level matcher
-refactor.
+The drop from `L256xO1` (9.52 µs) to `L4xO64` (1.79 µs) — same total work,
+~5.3× wall-clock — is the headline payoff of the per-level matcher refactor
+(v0.0.2).
 
 ### `cancel/mid_book`
 
@@ -184,7 +143,7 @@ iteration runs **1024 operations**, drawn from a fixed deterministic RNG seed:
 
 The RNG sequence is built once during setup so the timed body contains no RNG
 overhead. This is the closest thing to a realistic throughput measurement here;
-the ~27 ns/op aggregate is a reasonable upper bound for what the engine can
+the ~9.5 ns/op aggregate is a reasonable upper bound for what the engine can
 sustain at this book size.
 
 ## Notes on noise and methodology
@@ -192,9 +151,11 @@ sustain at this book size.
 - **Setup is not timed.** `iter_batched(setup, body, BatchSize::SmallInput)`
   runs `setup` outside the measured region.
 - **Slab capacity is 1 MiB slots** (`SLAB_CAP = 1 << 20`). That makes
-  `order_index` start out HashMap-pre-sized for 1M entries, which inflates
-  insert-path numbers (`limit_rest`) relative to a smaller-book setup. If you
-  ever benchmark pure insert throughput at production sizes, drop `SLAB_CAP`.
+  `order_index` start out HashMap-pre-sized for 1M entries. Under the default
+  SipHash hasher this dominated `limit_rest` (every iter paid full hash setup
+  on a near-empty map); with the v0.0.5 `U64Mixer` it's no longer visible in
+  the numbers, but the pre-sizing still affects cache footprint — if you
+  benchmark pure insert throughput at production sizes, drop `SLAB_CAP`.
 - **`limit_sweep` ≈ `market_sweep`** at every level count: both paths delegate
   to `match_against_opposite`, so the only difference is the per-iteration
   limit-price check (~1 cycle, masked by hashmap latency).
