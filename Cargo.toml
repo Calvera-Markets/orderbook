@@ -4,14 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow.workspace = true
 
 [dev-dependencies]
 criterion = "0.8.2"
 rand = { workspace = true }
+# Path dep: calvera is excluded from the workspace (its own `[workspace]`),
+# so reference it directly. Used by the disruptor-batched bench to publish
+# fills into a Disruptor instead of collecting them into a `Vec<Fill>`.
+calvera = { path = "../calvera" }
 
 [[bench]]
 name = "hmap_book"
+harness = false
+
+[[bench]]
+name = "hmap_book_disruptor_batched"
 harness = false
 
 [[example]]

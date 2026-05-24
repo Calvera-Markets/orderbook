@@ -19,12 +19,17 @@
 //!   sweep-market  → market_sweep                    (market-order multi-level)
 //!   cancel        → cancel/mid_book                 (O(1) cancel)
 
-use calvera_books::{MarketOrderMode, OrderBook, OrderId, Price, Side};
+use calvera_books::hmap_book::{MarketOrderMode, OrderBook, OrderId, Price, Side, VecConsumer};
 use std::env;
 use std::time::{Duration, Instant};
 
 const SLAB_CAP: usize = 1 << 18; // 262_144
 const MID: u64 = 1_000_000;
+
+// Same book shape as the criterion benches: VecConsumer accumulates each
+// fill into a Vec<Fill>. The profiler clears the Vec between iterations
+// (see modes below) so it doesn't grow unboundedly across the 12s run.
+type Book = OrderBook<VecConsumer>;
 
 /// Bitmask for the deadline-check throttle. We only call `Instant::now()` when
 /// `(tick & POLL_MASK) == 0`, i.e. once every 4096 iterations. Without this,
@@ -72,7 +77,7 @@ fn main() {
 // Does NOT exercise: level creation (BTreeSet/HashMap insert for new price).
 // ---------------------------------------------------------------------------
 fn profile_rest_single(deadline: Instant) {
-    let mut book = OrderBook::new(SLAB_CAP);
+    let mut book = Book::new(SLAB_CAP);
     let mut oid: u64 = 0;
     let mut ops: u64 = 0;
     let mut rebuilds: u64 = 0;
@@ -90,7 +95,7 @@ fn profile_rest_single(deadline: Instant) {
             .add_limit_order(OrderId(oid), Side::Bid, Price(MID - 1), 1)
             .is_err()
         {
-            book = OrderBook::new(SLAB_CAP);
+            book = Book::new(SLAB_CAP);
             oid = 0;
             rebuilds += 1;
         }
@@ -108,7 +113,7 @@ fn profile_rest_single(deadline: Instant) {
 //            order_index insert.
 // ---------------------------------------------------------------------------
 fn profile_rest_spread(deadline: Instant) {
-    let mut book = OrderBook::new(SLAB_CAP);
+    let mut book = Book::new(SLAB_CAP);
     let mut oid: u64 = 0;
     let mut ops: u64 = 0;
     let mut rebuilds: u64 = 0;
@@ -127,7 +132,7 @@ fn profile_rest_spread(deadline: Instant) {
             .add_limit_order(OrderId(oid), Side::Bid, Price(price), 1)
             .is_err()
         {
-            book = OrderBook::new(SLAB_CAP);
+            book = Book::new(SLAB_CAP);
             oid = 0;
             rebuilds += 1;
         }
@@ -151,7 +156,7 @@ fn profile_match_single(deadline: Instant) {
     let mut tick: u64 = 0;
     let mut done = false;
     while !done {
-        let mut book = OrderBook::new(SLAB_CAP);
+        let mut book = Book::new(SLAB_CAP);
         for i in 1..=DEPTH {
             let _ = book.add_limit_order(OrderId(i), Side::Ask, Price(MID + i), 1);
         }
@@ -171,7 +176,8 @@ fn profile_match_single(deadline: Instant) {
                     MarketOrderMode::ImmediateOrCancel,
                 )
                 .unwrap();
-            if res.fills.is_empty() {
+            book.consumer.fills.clear();
+            if res.filled_quantity == 0 {
                 break;
             }
             next += 1;
@@ -201,10 +207,11 @@ fn profile_sweep_limit(deadline: Instant) {
     let mut tick: u64 = 0;
     let mut done = false;
     while !done {
-        let mut book = OrderBook::new(SLAB_CAP);
+        let mut book = Book::new(SLAB_CAP);
         for i in 1..=DEPTH {
             let _ = book.add_limit_order(OrderId(2 * i - 1), Side::Bid, Price(MID - i), 1);
             let _ = book.add_limit_order(OrderId(2 * i), Side::Ask, Price(MID + i), 1);
+            book.consumer.fills.clear();
         }
         rebuilds += 1;
         loop {
@@ -218,17 +225,20 @@ fn profile_sweep_limit(deadline: Instant) {
                 Side::Bid => Price(MID + DEPTH),
                 Side::Ask => Price(MID - DEPTH),
             };
-            let fills = book
+            let _ = book
                 .add_limit_order(OrderId(next_oid), side, cross_price, SWEEP_QTY)
                 .unwrap();
+            let fills_this_call = book.consumer.fills.len() as u64;
+            book.consumer.fills.clear();
             next_oid += 1;
             total_orders += 1;
-            total_fills += fills.len() as u64;
+            total_fills += fills_this_call;
             side = match side {
                 Side::Bid => Side::Ask,
                 Side::Ask => Side::Bid,
             };
-            if fills.is_empty() {
+            // Nothing matched — book exhausted on this side.
+            if fills_this_call == 0 {
                 break;
             }
         }
@@ -251,7 +261,6 @@ fn profile_sweep_market(deadline: Instant) {
     const DEPTH: u64 = 100_000;
     const SWEEP_QTY: u64 = 8;
     let mut total_orders: u64 = 0;
-    let mut total_fills: u64 = 0;
     let mut rebuilds: u64 = 0;
     let mut next_oid: u64 = 2 * DEPTH + 1;
     let mut side = Side::Bid;
@@ -259,7 +268,7 @@ fn profile_sweep_market(deadline: Instant) {
     let mut tick: u64 = 0;
     let mut done = false;
     while !done {
-        let mut book = OrderBook::new(SLAB_CAP);
+        let mut book = Book::new(SLAB_CAP);
         for i in 1..=DEPTH {
             let _ = book.add_limit_order(OrderId(2 * i - 1), Side::Bid, Price(MID - i), 1);
             let _ = book.add_limit_order(OrderId(2 * i), Side::Ask, Price(MID + i), 1);
@@ -281,21 +290,19 @@ fn profile_sweep_market(deadline: Instant) {
                 .unwrap();
             next_oid += 1;
             total_orders += 1;
-            total_fills += res.fills.len() as u64;
             side = match side {
                 Side::Bid => Side::Ask,
                 Side::Ask => Side::Bid,
             };
-            if res.fills.is_empty() {
+            if res.filled_quantity == 0 {
                 break;
             }
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!(
-        "sweep-market: {} orders, {} fills in {:.2}s, {:.0} orders/sec, {} rebuilds",
+        "sweep-market: {} orders in {:.2}s, {:.0} orders/sec, {} rebuilds",
         total_orders,
-        total_fills,
         elapsed,
         total_orders as f64 / elapsed,
         rebuilds
@@ -313,7 +320,7 @@ fn profile_cancel(deadline: Instant) {
     let mut tick: u64 = 0;
     let mut done = false;
     while !done {
-        let mut book = OrderBook::new(SLAB_CAP);
+        let mut book = Book::new(SLAB_CAP);
         for i in 1..=DEPTH {
             let _ = book.add_limit_order(OrderId(i), Side::Bid, Price(MID - i), 1);
         }
