@@ -14,11 +14,11 @@ rand = { workspace = true }
 calvera = { path = "../calvera" }
 
 [[bench]]
-name = "hmap_book"
+name = "orderbook"
 harness = false
 
 [[bench]]
-name = "hmap_book_disruptor_batched"
+name = "orderbook_disruptor_batched"
 harness = false
 
 [[example]]

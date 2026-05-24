@@ -1,5 +1,7 @@
-use calvera_books::hmap_book::{MarketOrderMode, OrderBook, OrderId, Price, Side, VecConsumer};
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use calvera_books::orderbook::{MarketOrderMode, OrderBook, OrderId, Price, Side, VecConsumer};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 const SLAB_CAP: usize = 1 << 20; // 1,048,576
@@ -22,7 +24,6 @@ fn populated_book(levels: u64, orders_per_level: u64) -> Book {
         for _ in 0..orders_per_level {
             oid += 1;
             let _ = book.add_limit_order(OrderId(oid), Side::Bid, Price(10_000 - i), 1);
-
         }
         for _ in 0..orders_per_level {
             oid += 1;
@@ -94,21 +95,25 @@ fn bench_limit_sweep_levels(c: &mut Criterion) {
     let mut g = c.benchmark_group("limit_sweep_levels");
     for &levels in &[4u64, 16, 64, 256] {
         g.throughput(Throughput::Elements(levels));
-        g.bench_with_input(BenchmarkId::from_parameter(levels), &levels, |b, &levels| {
-            b.iter_batched(
-                || populated_book(levels, 1),
-                |mut book| {
-                    let res = book.add_limit_order(
-                        black_box(OrderId(u64::MAX)),
-                        Side::Bid,
-                        Price(10_000 + levels),
-                        levels,
-                    );
-                    (book, res)
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        g.bench_with_input(
+            BenchmarkId::from_parameter(levels),
+            &levels,
+            |b, &levels| {
+                b.iter_batched(
+                    || populated_book(levels, 1),
+                    |mut book| {
+                        let res = book.add_limit_order(
+                            black_box(OrderId(u64::MAX)),
+                            Side::Bid,
+                            Price(10_000 + levels),
+                            levels,
+                        );
+                        (book, res)
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
     g.finish();
 }
@@ -120,21 +125,25 @@ fn bench_market_sweep(c: &mut Criterion) {
     let mut g = c.benchmark_group("market_sweep");
     for &levels in &[4u64, 16, 64, 256] {
         g.throughput(Throughput::Elements(levels));
-        g.bench_with_input(BenchmarkId::from_parameter(levels), &levels, |b, &levels| {
-            b.iter_batched(
-                || populated_book(levels, 1),
-                |mut book| {
-                    let res = book.add_market_order(
-                        black_box(OrderId(u64::MAX)),
-                        Side::Bid,
-                        levels,
-                        MarketOrderMode::ImmediateOrCancel,
-                    );
-                    (book, res)
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        g.bench_with_input(
+            BenchmarkId::from_parameter(levels),
+            &levels,
+            |b, &levels| {
+                b.iter_batched(
+                    || populated_book(levels, 1),
+                    |mut book| {
+                        let res = book.add_market_order(
+                            black_box(OrderId(u64::MAX)),
+                            Side::Bid,
+                            levels,
+                            MarketOrderMode::ImmediateOrCancel,
+                        );
+                        (book, res)
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
     g.finish();
 }
@@ -210,13 +219,18 @@ fn bench_mixed_workload(c: &mut Criterion) {
                 let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
                 let book = populated_book(50, 4); // ~400 resting orders to start
                 // Pre-generate the op sequence so RNG is not in the timed body.
-                let mut ops: Vec<(bool, OrderId, Side, Price, u64)> = Vec::with_capacity(ops_per_iter as usize);
+                let mut ops: Vec<(bool, OrderId, Side, Price, u64)> =
+                    Vec::with_capacity(ops_per_iter as usize);
                 let mut next_oid: u64 = 100_000;
                 for _ in 0..ops_per_iter {
                     let is_add = rng.random_bool(0.7);
                     if is_add {
                         next_oid += 1;
-                        let side = if rng.random_bool(0.5) { Side::Bid } else { Side::Ask };
+                        let side = if rng.random_bool(0.5) {
+                            Side::Bid
+                        } else {
+                            Side::Ask
+                        };
                         let offset: u64 = rng.random_range(1..=50);
                         let price = match side {
                             Side::Bid => Price(10_000 - offset),

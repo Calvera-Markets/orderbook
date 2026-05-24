@@ -19,7 +19,7 @@
 //!   sweep-market  → market_sweep                    (market-order multi-level)
 //!   cancel        → cancel/mid_book                 (O(1) cancel)
 
-use calvera_books::hmap_book::{MarketOrderMode, OrderBook, OrderId, Price, Side, VecConsumer};
+use calvera_books::orderbook::{MarketOrderMode, OrderBook, OrderId, Price, Side, VecConsumer};
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -53,10 +53,7 @@ fn usage() -> ! {
 fn main() {
     let mut args = env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| usage());
-    let secs: u64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
     let deadline = Instant::now() + Duration::from_secs(secs);
 
     eprintln!("mode={} duration={}s", mode, secs);
@@ -103,7 +100,10 @@ fn profile_rest_single(deadline: Instant) {
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!(
         "rest-single:  {} ops in {:.2}s, {:.0} ops/sec, {} rebuilds",
-        ops, elapsed, ops as f64 / elapsed, rebuilds
+        ops,
+        elapsed,
+        ops as f64 / elapsed,
+        rebuilds
     );
 }
 
@@ -140,7 +140,10 @@ fn profile_rest_spread(deadline: Instant) {
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!(
         "rest-spread:  {} ops in {:.2}s, {:.0} ops/sec, {} rebuilds",
-        ops, elapsed, ops as f64 / elapsed, rebuilds
+        ops,
+        elapsed,
+        ops as f64 / elapsed,
+        rebuilds
     );
 }
 
@@ -187,7 +190,10 @@ fn profile_match_single(deadline: Instant) {
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!(
         "match-single: {} matches in {:.2}s, {:.0} matches/sec, {} rebuilds",
-        total, elapsed, total as f64 / elapsed, rebuilds
+        total,
+        elapsed,
+        total as f64 / elapsed,
+        rebuilds
     );
 }
 
@@ -338,6 +344,9 @@ fn profile_cancel(deadline: Instant) {
     let elapsed = start.elapsed().as_secs_f64();
     eprintln!(
         "cancel:       {} cancels in {:.2}s, {:.0} cancels/sec, {} rebuilds",
-        total, elapsed, total as f64 / elapsed, rebuilds
+        total,
+        elapsed,
+        total as f64 / elapsed,
+        rebuilds
     );
 }
