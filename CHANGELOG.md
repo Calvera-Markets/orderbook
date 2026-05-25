@@ -1,5 +1,89 @@
 # calvera-books — Changelog
 
+## v0.0.6 — `OrderId` → engine-assigned generational `OrderHandle`
+
+**Change.** Deleted the `OrderId` type. Callers no longer pick the
+identity of an order; the engine assigns an opaque `OrderHandle` on
+`add_limit_order` and the caller hands it back to `cancel_limit_order`.
+The handle is a `NonZeroU64` packing `(generation, slab_index)` — i.e.
+it *is* the slab address plus an ABA-defence counter, not a key into a
+side table.
+
+The `order_index: U64Map<OrderId, (SlabIndex, Side, Price)>` hashmap that
+existed only to translate caller-chosen `OrderId`s into slab addresses
+is gone with the type that motivated it. Cancel now decodes the handle,
+indexes the slab directly, and rejects stale handles via a per-slot
+generation compare — no hashmap probe, no bucket cache miss.
+
+Layout changes that fall out of this:
+
+- `Order.order_id: OrderId` (8 B) → `Order.generation: NonZeroU32` (4 B) +
+  `Order.side: Side` (1 B) + 3 B pad. Struct stays 32 B / `align(32)`, two
+  per cache line as before.
+- `Side` moved out of `order_index` and onto the slot itself; cancel reads
+  it from `slab[idx]` after the generation check.
+- `OrderSlab::free` bumps the slot's generation; `alloc_slot` returns
+  `(idx, generation)` so the caller can build the handle without re-reading.
+- During a sweep, every fully-consumed order has its generation bumped
+  inline — one cache-line write per fill, replacing the per-fill
+  `order_index.remove` (a hashmap delete).
+- `Fill.resting_id` is now `OrderHandle` (was `OrderId`).
+- Public API: `add_limit_order` drops its `order_id` param and returns
+  `BookResult<Option<OrderHandle>>` (`None` if the aggressor was fully
+  consumed by matching). `cancel_limit_order(handle: OrderHandle)`.
+  `add_market_order` drops its previously-unused `_order_id` param.
+  `OrderId` is gone.
+
+ABA defence: a stale handle whose slot has been reused or matched out
+returns `BookError::OrderNotFound` from the generation check. Tested by
+two new scenarios in `parity_2.rs` (`stale_handle_after_recycle_is_rejected`,
+`stale_handle_after_match_is_rejected`).
+
+**Why.** Profiling showed `order_index` HashMap operations dominating the
+cancel path and contributing meaningfully on every match. The hashmap was
+a *cache* of `(SlabIndex, Side, Price)` keyed by `OrderId` — but `SlabIndex`
+is exactly what an engine-assigned handle can encode, and `Side`/`Price`
+already live on the slot. Once the engine controls ID generation, the
+hashmap is redundant. This is what production exchanges do with FIX
+`OrderID(37)`: the exchange-assigned ID is the internal data-structure
+handle; client-side `ClOrdID(11)` translation lives in the OMS, not the
+matcher.
+
+The generational-index pattern (`(idx, gen)` handle, bump on free) is the
+standard ABA defence — same shape as Rust's `slotmap` crate, Bevy's
+`Entity`, and Serum DEX's packed `(price_level, slot)` cancel handle.
+
+**Perf.** Headline reductions vs v0.0.5 (median, same harness, criterion
+default settings):
+
+| Benchmark                          | v0.0.5       | v0.0.6   | Δ        |
+| ---------------------------------- | -----------: | -------: | -------: |
+| `limit_rest/single_level`          | 112 ns       | 74.0 ns  | **−34%** |
+| `limit_rest/spread_levels`         | 88.9 ns      | 78.7 ns  | −11%     |
+| `limit_match_single/full_consume`  | 200 ns       | 69.1 ns  | **−65%** |
+| `limit_sweep_levels/4`             | 128 ns       | 99.1 ns  | −22%     |
+| `limit_sweep_levels/256`           | 9.27 µs      | 6.64 µs  | −28%     |
+| `market_sweep/256`                 | 9.35 µs      | 6.35 µs  | −32%     |
+| `market_sweep_opl/L16xO16`         | 2.10 µs      | 1.09 µs  | **−48%** |
+| `market_sweep_opl/L4xO64`          | 1.87 µs      | 0.94 µs  | **−50%** |
+| `cancel/mid_book` *(see note)*     | 51.2 ns      | 31.1 ns  | **−39%** |
+| `mixed_workload/random_add_cancel` | 9.86 µs      | 6.09 µs  | **−38%** |
+
+*Note on `cancel/mid_book`*: under criterion's default `BatchSize::LargeInput`,
+v0.0.6 cancel was below the timer-resolution floor and reported "took zero
+time per iteration". The numbers above are from a `--measurement-time 15
+--sample-size 100` re-run for both versions, with confidence intervals
+[49.6, 52.7] ns (v0.0.5) and [29.6, 33.2] ns (v0.0.6) — non-overlapping.
+
+The biggest wins concentrate where the hashmap delete fired most often
+per call: deep sweeps (`market_sweep_opl/L4xO64` does 256 fills in one
+call, i.e. 256 hashmap deletes in v0.0.5 vs 256 cache-line writes in
+v0.0.6). The cancel-path saving (~20 ns) is consistent with one hashmap
+probe + bucket cache miss + delete being replaced by one cache-line read
++ integer compare.
+
+---
+
 ## v0.0.5 — Specialized `u64` hasher
 
 **Change.** Replaced the stdlib HashMap's default SipHash-1-3 with a SplitMix64

@@ -1,69 +1,79 @@
 # calvera-books — Benchmarks
 
 Numbers for the `OrderBook` implementation, collected with criterion 0.8. The
-"current" column tracks the latest version (v0.0.5 — see [`CHANGELOG.md`](CHANGELOG.md)
+"current" column tracks the latest version (v0.0.6 — see [`CHANGELOG.md`](CHANGELOG.md)
 for the per-version code/perf walkthrough).
 
 All times below are the **median** of a 100-sample run. Each iteration runs
 against a fresh book (criterion's `iter_batched`), so setup time is excluded
 from the measurement.
 
-## Current baseline (v0.0.5)
+## Current baseline (v0.0.6)
 
-Bench harness: `benches/hmap_book_2.rs` (`cargo bench -p calvera-books --bench
-hmap_book_2`). Slab capacity: 1 MiB (`SLAB_CAP = 1 << 20`). Consumer:
+Bench harness: `benches/orderbook.rs` (`cargo bench -p calvera-books --bench
+orderbook`). Slab capacity: 1 MiB (`SLAB_CAP = 1 << 20`). Consumer:
 `VecConsumer` (appends every fill to a `Vec<Fill>`).
 
 | Benchmark                          | Median    | Per-element / per-level    |
 | ---------------------------------- | --------- | -------------------------- |
-| `limit_rest/single_level`          | 101 ns    | one insert, empty book     |
-| `limit_rest/spread_levels`         | 106 ns    | one insert, 1000-level book |
-| `limit_match_single/full_consume`  | 82.5 ns   | one full-consume match     |
-| `limit_sweep_levels/4`             | 133 ns    | ~33 ns / level             |
-| `limit_sweep_levels/16`            | 574 ns    | ~36 ns / level             |
-| `limit_sweep_levels/64`            | 2.00 µs   | ~31 ns / level             |
-| `limit_sweep_levels/256`           | 9.31 µs   | ~36 ns / level             |
-| `market_sweep/4`                   | 133 ns    | ~33 ns / level             |
-| `market_sweep/16`                  | 627 ns    | ~39 ns / level             |
-| `market_sweep/64`                  | 2.14 µs   | ~33 ns / level             |
-| `market_sweep/256`                 | 9.59 µs   | ~37 ns / level             |
-| `market_sweep_opl/L256xO1`         | 9.52 µs   | ~37 ns / fill (OPL=1)      |
-| `market_sweep_opl/L64xO4`          | 3.42 µs   | ~13 ns / fill (OPL=4)      |
-| `market_sweep_opl/L16xO16`         | 2.14 µs   | ~8.3 ns / fill (OPL=16)    |
-| `market_sweep_opl/L4xO64`          | 1.79 µs   | ~7.0 ns / fill (OPL=64)    |
-| `cancel/mid_book`                  | 42 ns     | O(1) cancel                |
-| `mixed_workload/random_add_cancel` | 9.72 µs   | ~9.5 ns / op (1024 ops)    |
+| `limit_rest/single_level`          | 74.0 ns   | one insert, empty book     |
+| `limit_rest/spread_levels`         | 78.7 ns   | one insert, 1000-level book |
+| `limit_match_single/full_consume`  | 69.1 ns   | one full-consume match     |
+| `limit_sweep_levels/4`             | 99.1 ns   | ~25 ns / level             |
+| `limit_sweep_levels/16`            | 476 ns    | ~30 ns / level             |
+| `limit_sweep_levels/64`            | 1.59 µs   | ~25 ns / level             |
+| `limit_sweep_levels/256`           | 6.64 µs   | ~26 ns / level             |
+| `market_sweep/4`                   | 94.2 ns   | ~24 ns / level             |
+| `market_sweep/16`                  | 445 ns    | ~28 ns / level             |
+| `market_sweep/64`                  | 1.47 µs   | ~23 ns / level             |
+| `market_sweep/256`                 | 6.35 µs   | ~25 ns / level             |
+| `market_sweep_opl/L256xO1`         | 6.25 µs   | ~24 ns / fill (OPL=1)      |
+| `market_sweep_opl/L64xO4`          | 1.93 µs   | ~7.5 ns / fill (OPL=4)     |
+| `market_sweep_opl/L16xO16`         | 1.09 µs   | ~4.2 ns / fill (OPL=16)    |
+| `market_sweep_opl/L4xO64`          | 936 ns    | ~3.7 ns / fill (OPL=64)    |
+| `cancel/mid_book` *(see note)*     | 31.1 ns   | O(1) cancel                |
+| `mixed_workload/random_add_cancel` | 6.09 µs   | ~5.9 ns / op (1024 ops)    |
 
-## v0.0.1 → v0.0.5
+*Note on `cancel/mid_book`*: under criterion's default `BatchSize::LargeInput`,
+v0.0.6 cancel is below the timer-resolution floor — criterion reports "took
+zero time per iteration." The 31.1 ns figure is from a `--measurement-time
+15 --sample-size 100` re-run (full log:
+`benches/logs/bench-v2-cancel-confirm-*.log`). Confidence interval
+[29.6, 33.2] ns, no overlap with the v0.0.5 [49.6, 52.7] ns interval from
+the matching re-run.
+
+## v0.0.1 → v0.0.6
 
 Initial implementation against latest. Same machine, identical bench harness,
 `VecConsumer` on both sides. Per-version detail (what each step changed and
 why) lives in [`CHANGELOG.md`](CHANGELOG.md).
 
-| Benchmark                          | v0.0.1    | v0.0.5   | Δ        |
+| Benchmark                          | v0.0.1    | v0.0.6   | Δ        |
 | ---------------------------------- | --------- | -------- | -------- |
-| `limit_rest/single_level`          | 2.84 µs   | 101 ns   | **−96%** |
-| `limit_rest/spread_levels`         | 2.74 µs   | 106 ns   | **−96%** |
-| `limit_match_single/full_consume`  | 244 ns    | 82.5 ns  | **−66%** |
-| `limit_sweep_levels/4`             | 345 ns    | 133 ns   | **−61%** |
-| `limit_sweep_levels/16`            | 1.34 µs   | 574 ns   | **−57%** |
-| `limit_sweep_levels/64`            | 5.49 µs   | 2.00 µs  | **−63%** |
-| `limit_sweep_levels/256`           | 21.67 µs  | 9.31 µs  | **−57%** |
-| `market_sweep/4`                   | 343 ns    | 133 ns   | **−61%** |
-| `market_sweep/16`                  | 1.36 µs   | 627 ns   | **−54%** |
-| `market_sweep/64`                  | 5.47 µs   | 2.14 µs  | **−61%** |
-| `market_sweep/256`                 | 21.83 µs  | 9.59 µs  | **−56%** |
-| `market_sweep_opl/L256xO1`         | 21.78 µs  | 9.52 µs  | **−56%** |
-| `market_sweep_opl/L64xO4`          | 15.90 µs  | 3.42 µs  | **−79%** |
-| `market_sweep_opl/L16xO16`         | 13.37 µs  | 2.14 µs  | **−84%** |
-| `market_sweep_opl/L4xO64`          | 12.20 µs  | 1.79 µs  | **−85%** |
-| `cancel/mid_book` *(see note)*     | 127 ns    | 42 ns    | **−67%** |
-| `mixed_workload/random_add_cancel` | 47.92 µs  | 9.72 µs  | **−80%** |
+| `limit_rest/single_level`          | 2.84 µs   | 74.0 ns  | **−97%** |
+| `limit_rest/spread_levels`         | 2.74 µs   | 78.7 ns  | **−97%** |
+| `limit_match_single/full_consume`  | 244 ns    | 69.1 ns  | **−72%** |
+| `limit_sweep_levels/4`             | 345 ns    | 99.1 ns  | **−71%** |
+| `limit_sweep_levels/16`            | 1.34 µs   | 476 ns   | **−64%** |
+| `limit_sweep_levels/64`            | 5.49 µs   | 1.59 µs  | **−71%** |
+| `limit_sweep_levels/256`           | 21.67 µs  | 6.64 µs  | **−69%** |
+| `market_sweep/4`                   | 343 ns    | 94.2 ns  | **−73%** |
+| `market_sweep/16`                  | 1.36 µs   | 445 ns   | **−67%** |
+| `market_sweep/64`                  | 5.47 µs   | 1.47 µs  | **−73%** |
+| `market_sweep/256`                 | 21.83 µs  | 6.35 µs  | **−71%** |
+| `market_sweep_opl/L256xO1`         | 21.78 µs  | 6.25 µs  | **−71%** |
+| `market_sweep_opl/L64xO4`          | 15.90 µs  | 1.93 µs  | **−88%** |
+| `market_sweep_opl/L16xO16`         | 13.37 µs  | 1.09 µs  | **−92%** |
+| `market_sweep_opl/L4xO64`          | 12.20 µs  | 936 ns   | **−92%** |
+| `cancel/mid_book` *(see note)*     | 127 ns    | 31.1 ns  | **−76%** |
+| `mixed_workload/random_add_cancel` | 47.92 µs  | 6.09 µs  | **−87%** |
 
 *Note on `cancel/mid_book`*: the v0.0.1 number (127 ns) is **with the slab-slot
 leak fixed** — pre-fix v0.0.1 reported 91 ns because it was skipping
 `slab.free` (the slot was leaked), so it was doing strictly less work. The
-fix landed in v0.0.2.
+fix landed in v0.0.2. The v0.0.6 number is from a longer-measurement re-run
+(see the current-baseline note above) because the default-config measurement
+falls below the timer-resolution floor.
 
 ## What each bench measures
 

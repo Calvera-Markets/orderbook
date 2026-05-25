@@ -1,6 +1,6 @@
 [package]
 name = "calvera-books"
-version = "0.1.0"
+version = "0.0.6"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,10 @@ calvera = { git = "https://github.com/kaizu-xyz/calvera.git", branch = "main" }
 [[bench]]
 name = "orderbook"
 harness = false
+
+# [[bench]]
+# name = "orderbook_2"
+# harness = false
 
 [[bench]]
 name = "orderbook_disruptor_batched"

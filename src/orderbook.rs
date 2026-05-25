@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 // TODO: Consider using sentinel u32::MAX instead of Zero, that way we avoid dead slot at i=0
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::errors::{BookError, BookResult};
 use crate::u64_map::U64Map;
@@ -11,9 +11,6 @@ pub struct OrderBook<C: FillConsumer> {
     bids: HalfBook,
     asks: HalfBook,
     slab: OrderSlab,
-    /// order_id → (SlabIndex, Side, Price)
-    /// Required for O(1) cancel without scanning the book.
-    order_index: U64Map<OrderId, (SlabIndex, Side, Price)>,
     /// Fill sink. Bound at the type level — `C` is chosen by the binary that
     /// constructs the `OrderBook`. The matcher calls `consumer.on_fill(...)`
     /// once per fill; because `C` is a concrete type and `on_fill` is
@@ -46,7 +43,6 @@ impl<C: FillConsumer> OrderBook<C> {
             bids: HalfBook::new(Side::Bid),
             asks: HalfBook::new(Side::Ask),
             slab: OrderSlab::with_capacity(slab_capacity),
-            order_index: U64Map::with_capacity_and_hasher(slab_capacity, Default::default()),
             consumer,
         }
     }
@@ -139,20 +135,22 @@ impl<C: FillConsumer> OrderBook<C> {
                     // or partially consume (one slab write at the end).
                     let slot = &self.slab.slots[current_idx.as_usize()];
                     let resting_qty = slot.quantity;
-                    let resting_id = slot.order_id;
+                    let resting_handle = OrderHandle::new(current_idx, slot.generation);
                     let next_idx = slot.next;
 
                     let fill_qty = remaining.min(resting_qty);
                     remaining -= fill_qty;
                     self.consumer.on_fill(Fill {
-                        resting_id,
+                        resting_id: resting_handle,
                         quantity: fill_qty,
                     });
 
                     if fill_qty == resting_qty {
                         // Full consume. Donate to this level's freed chain
-                        // (no slab write — already linked via `Order.next`).
-                        self.order_index.remove(&resting_id);
+                        // (no link write — already linked via `Order.next`).
+                        // Bump the slot's generation so any stale handle held
+                        // by a consumer fails the cancel-time check.
+                        self.slab.bump_generation(current_idx);
                         consumed_qty += fill_qty;
                         consumed_count += 1;
                         level_last_freed = current_idx;
@@ -263,25 +261,24 @@ impl<C: FillConsumer> OrderBook<C> {
     // (2) Rest any unfilled remainder on our own side
     //     (a) Insert order in slab
     //     (b) Update price level and slab links
-    //     (c) Update order index map
+    //     (c) Return the engine-assigned `OrderHandle` to the caller
     pub fn add_limit_order(
         &mut self,
-        order_id: OrderId,
         side: Side,
         price: Price,
         quantity: u64,
-    ) -> BookResult<()> {
+    ) -> BookResult<Option<OrderHandle>> {
         // Limit semantics: stop matching when price no longer crosses.
         let remaining = self.match_against_opposite(side, Some(price), quantity)?;
 
-        if remaining > 0 {
-            let order_idx = self.slab.alloc_slot()?;
+        let handle = if remaining > 0 {
+            let (order_idx, generation) = self.slab.alloc_slot()?;
             let slot = self.slab.get_mut(order_idx);
-            slot.order_id = order_id;
             slot.price = price;
             slot.quantity = remaining;
             slot.prev = None;
             slot.next = None;
+            slot.side = side;
 
             match side {
                 Side::Ask => self
@@ -292,21 +289,30 @@ impl<C: FillConsumer> OrderBook<C> {
                     .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
             };
 
-            self.order_index.insert(order_id, (order_idx, side, price));
-        }
+            Some(OrderHandle::new(order_idx, generation))
+        } else {
+            None
+        };
 
         self.consumer.flush();
-        Ok(())
+        Ok(handle)
     }
 
-    // (1) Lookup + remove from order_index
-    // (2) Unlink from price level (stitch prev/next, drop level if empty)
-    // (3) Return slot to freelist
-    pub fn cancel_limit_order(&mut self, order_id: OrderId) -> BookResult<()> {
-        let (idx, side, price) = self
-            .order_index
-            .remove(&order_id)
-            .ok_or(BookError::OrderNotFound)?;
+    // (1) Decode handle → (idx, generation); reject stale handles via the
+    //     per-slot generation check (no hashmap probe)
+    // (2) Read side + price from the slot (was kept in `order_index`)
+    // (3) Unlink from price level (stitch prev/next, drop level if empty)
+    // (4) Return slot to freelist (bumps generation, invalidating the handle)
+    pub fn cancel_limit_order(&mut self, handle: OrderHandle) -> BookResult<()> {
+        let idx = handle.idx();
+        let generation = handle.generation();
+
+        let slot = &self.slab.slots[idx.as_usize()];
+        if slot.generation != generation {
+            return Err(BookError::OrderNotFound);
+        }
+        let side = slot.side;
+        let price = slot.price;
 
         match side {
             Side::Bid => self.bids.remove_order_from_l2_book_and_update_slab_links(
@@ -331,7 +337,6 @@ impl<C: FillConsumer> OrderBook<C> {
     // (3) Updates order index map
     pub fn add_market_order(
         &mut self,
-        _order_id: OrderId,
         side: Side,
         quantity: u64,
         mode: MarketOrderMode,
@@ -548,13 +553,18 @@ impl PriceLevel {
     }
 }
 
-/// Slab allocator with no per-slot discriminant.
+/// Slab allocator. Slots store `Order` directly.
 ///
-/// Slots store `Order` directly. When a slot is on the freelist, its
-/// `Order.next` field is repurposed as the freelist link; the other fields
-/// (`order_id`, `price`, `quantity`, `side`, `prev`) are garbage. Callers
-/// must not read a free slot — invariant maintained by the matcher and by
-/// `order_index` only holding indices of occupied slots.
+/// When a slot is on the freelist, its `Order.next` field is repurposed
+/// as the freelist link; `price`, `quantity`, `prev`, `side` are garbage.
+/// The `generation` field is the one part of an `Order` that remains
+/// meaningful while the slot is free — it's bumped on `free()` so any
+/// stale `OrderHandle` held by an external consumer fails the cancel-time
+/// generation check (ABA defence).
+///
+/// Callers must not read a free slot's matching fields — invariant
+/// maintained by the matcher and by the generation check in
+/// `cancel_limit_order`.
 pub struct OrderSlab {
     slots: Vec<Order>,
     free_head: Option<SlabIndex>,
@@ -568,14 +578,21 @@ impl OrderSlab {
         let total_slots = capacity + 1;
         let mut slots = Vec::with_capacity(total_slots);
 
+        // SAFETY: 1 is non-zero. Used as the starting generation for every
+        // slot — first alloc returns gen=1, subsequent allocs see the
+        // bumped value from the previous free.
+        let gen_one = unsafe { NonZeroU32::new_unchecked(1) };
+
         // slots[0]: reserved sentinel slot, never reachable from any
         // SlabIndex.
         slots.push(Order {
-            order_id: OrderId(0),
             price: Price(0),
             quantity: 0,
             prev: None,
             next: None,
+            generation: gen_one,
+            side: Side::Bid,
+            _pad: [0; 3],
         });
 
         // slots[1..=capacity]: freelist 1 -> 2 -> … -> capacity -> None.
@@ -585,14 +602,17 @@ impl OrderSlab {
             } else {
                 None
             };
-            // Placeholder `Order` — only `next` (the freelist link) is
-            // meaningful while the slot is free.
+            // Placeholder `Order` — only `next` (the freelist link) and
+            // `generation` (ABA defence) are meaningful while the slot is
+            // free.
             slots.push(Order {
-                order_id: OrderId(0),
                 price: Price(0),
                 quantity: 0,
                 prev: None,
                 next: next_free,
+                generation: gen_one,
+                side: Side::Bid,
+                _pad: [0; 3],
             });
         }
 
@@ -613,23 +633,47 @@ impl OrderSlab {
         &mut self.slots[idx.as_usize()]
     }
 
+    /// Bump the generation of the given slot. Called at every slot-recycle
+    /// point (cancel via `free`, full-consume during matching) so any
+    /// outstanding `OrderHandle` for the previous occupant fails the
+    /// cancel-time check. ABA defence.
+    ///
+    /// Wraps from `u32::MAX → 1`, skipping `0` to keep the `NonZeroU32`
+    /// invariant.
+    #[inline(always)]
+    pub fn bump_generation(&mut self, idx: SlabIndex) {
+        let slot = &mut self.slots[idx.as_usize()];
+        let new_gen = slot.generation.get().wrapping_add(1);
+        let new_gen = if new_gen == 0 { 1 } else { new_gen };
+        // SAFETY: new_gen is non-zero by the branch above.
+        slot.generation = unsafe { NonZeroU32::new_unchecked(new_gen) };
+    }
+
+    /// Return `idx` to the freelist, bumping its generation. Any handle
+    /// that referenced the previous occupant will now fail the
+    /// cancel-time check.
     pub fn free(&mut self, idx: SlabIndex) {
-        self.slots[idx.as_usize()].next = self.free_head;
+        self.bump_generation(idx);
+        // common subexpression elimination (CSE) plus bounds-check elision
+        // re-borrowing is free, LLVM optimizes it away
+        let slot = &mut self.slots[idx.as_usize()];
+        slot.next = self.free_head;
         self.free_head = Some(idx);
     }
 
-    /// Claim a slot from the freelist. Returns its `SlabIndex`. The slot's
-    /// fields are left as-is from the previous occupant (or the default
-    /// for slots never yet used); the caller MUST overwrite every field
-    /// (`order_id`, `price`, `quantity`, `prev`, `next`) via `get_mut`
-    /// before any other code reads the slot.
-    pub fn alloc_slot(&mut self) -> BookResult<SlabIndex> {
+    /// Claim a slot from the freelist. Returns `(idx, generation)` — the
+    /// caller must build an `OrderHandle` from these and overwrite all of
+    /// `price`, `quantity`, `prev`, `next`, `side` via `get_mut` before
+    /// any other code reads the slot. `generation` is the value the slot
+    /// currently carries (set by the previous `free`).
+    pub fn alloc_slot(&mut self) -> BookResult<(SlabIndex, NonZeroU32)> {
         let idx = self.free_head.ok_or(BookError::SlabFull)?;
         // The slot's `next` field holds the freelist link while free; read
         // it before the caller overwrites the slot.
         let next_free = self.slots[idx.as_usize()].next;
         self.free_head = next_free;
-        Ok(idx)
+        let generation = self.slots[idx.as_usize()].generation;
+        Ok((idx, generation))
     }
 
     pub fn capacity(&self) -> usize {
@@ -645,11 +689,18 @@ impl OrderSlab {
 /// `#[repr(C, align(32))]` pins both the field layout and the struct
 /// alignment to 32, so a `Vec<Order>` is guaranteed to start at a 32-byte
 /// boundary and every random index lands in exactly one cache line — no
-/// straddle, regardless of `Vec` size or allocator. No padding needed
+/// straddle, regardless of `Vec` size or allocator.
+///
+/// Layout (32 B total): `price` (8) + `quantity` (8) + `prev` (4) +
+/// `next` (4) + `generation` (4) + `side` (1) + `_pad` (3). The
+/// engine-assigned `OrderHandle` is `(generation, slab_index)` — the
+/// index from the slot's position in the slab, the generation from the
+/// field below — so no `order_id` field is needed on the slot. `side`
+/// lives on the order because the slab is shared between bids and asks;
+/// cancel reads it from the slot after the generation check.
 #[repr(C, align(32))]
 #[derive(Debug, Clone)]
 pub struct Order {
-    pub order_id: OrderId,
     pub price: Price,
     pub quantity: u64, // remaining quantity (decremented on partial fill)
     // Intrusive linked list pointers within a price level's FIFO queue.
@@ -657,15 +708,105 @@ pub struct Order {
     // These are slab indices, not raw pointers — safe to store in a Vec.
     pub prev: Option<SlabIndex>, // order ahead in queue (older, higher priority)
     pub next: Option<SlabIndex>, // order behind in queue (newer, lower priority)
+    // Bumped on free() and on full-consume during matching. The
+    // cancel-time check rejects any handle whose generation no longer
+    // matches the slot's — ABA defence.
+    pub generation: NonZeroU32,
+    pub side: Side,
+    _pad: [u8; 3],
 }
 
+const _: () = assert!(std::mem::size_of::<Order>() == 32);
+const _: () = assert!(std::mem::align_of::<Order>() == 32);
+
+/// Engine-assigned, opaque order handle.
+///
+/// Packed `(generation, slab_index)`: generation in the high 32 bits,
+/// slab index in the low 32. Decoding is two shifts and a mask — no hash
+/// lookup. The outer `NonZeroU64` lets `Option<OrderHandle>` niche-pack
+/// to 8 bytes (the all-zero pattern becomes `None`).
+///
+/// # Provenance is part of the safety contract
+///
+/// Handles must only come from `OrderBook::add_limit_order` — they are
+/// "permissioned" in the sense that the engine is the sole legitimate
+/// issuer. `OrderHandle::new` is technically `pub` so tests and
+/// engine-internal code (the matcher constructing fill events, the
+/// slab returning newly-allocated handles) can build them, but
+/// production callers outside the engine should never call it directly.
+/// Treat the type as opaque: get one from `add_limit_order`, hand it
+/// back to `cancel_limit_order`, optionally read its `as_u64()` to put
+/// on a wire — but don't reverse-engineer the bits or fabricate values.
+///
+/// The engine relies on this contract to keep the ABA-defence check on
+/// `cancel_limit_order` sound. The three failure modes that are NOT
+/// caught by the generation check, and why the contract matters:
+///
+/// 1. **Generation wraparound.** After ~4 billion frees of the *same*
+///    slot, gen cycles through `1..=u32::MAX` and returns to a
+///    previously-issued value. A handle sitting around for 2³² cycles
+///    of its specific slot could match the slot's current gen again.
+///    Practically unreachable — even at one free per nanosecond per
+///    slot that's ~136 years per slot — but the type-level guarantee is
+///    "u32 of generation space," not infinite.
+///
+/// 2. **Out-of-range `idx`.** If a caller manufactures or corrupts a
+///    handle with `idx > slab.capacity`, the
+///    `self.slab.slots[idx.as_usize()]` access in `cancel_limit_order`
+///    panics *before* the generation check runs. Failure mode for
+///    malformed handles is therefore "panic," not "OrderNotFound."
+///    Fine for opaque, engine-issued handles; would need an explicit
+///    bounds check if the API ever accepted untrusted handles (e.g.
+///    deserialised over a network from another process).
+///
+/// 3. **Never-allocated slot.** All slots are initialised with
+///    `gen = 1`. If a caller fabricates `OrderHandle { idx, gen: 1 }`
+///    for an `idx` that has never been allocated, the gen check passes
+///    (slot.gen and handle.gen both equal 1). `cancel_limit_order` then
+///    reads garbage `side`/`price` from the slot, probably no-ops
+///    against a non-existent level, then calls `free` — which bumps
+///    gen and pushes the slot onto the freelist, **corrupting the
+///    freelist by double-linking** (the slot was already there from
+///    initialisation). Same root cause as (2): doesn't happen with
+///    engine-issued handles, but the safety property is "the engine
+///    controls all handles," not "any 8 bytes are safe to pass."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OrderId(pub u64);
+pub struct OrderHandle(NonZeroU64);
+
+impl OrderHandle {
+    #[inline(always)]
+    pub fn new(idx: SlabIndex, generation: NonZeroU32) -> Self {
+        let packed = ((generation.get() as u64) << 32) | (idx.0.get() as u64);
+        // SAFETY: both halves are NonZero, so the packed value is non-zero.
+        Self(unsafe { NonZeroU64::new_unchecked(packed) })
+    }
+
+    #[inline(always)]
+    pub fn idx(self) -> SlabIndex {
+        let lo = self.0.get() as u32;
+        // SAFETY: constructed from a NonZeroU32 in the low half.
+        SlabIndex(unsafe { NonZeroU32::new_unchecked(lo) })
+    }
+
+    #[inline(always)]
+    pub fn generation(self) -> NonZeroU32 {
+        let hi = (self.0.get() >> 32) as u32;
+        // SAFETY: constructed from a NonZeroU32 in the high half.
+        unsafe { NonZeroU32::new_unchecked(hi) }
+    }
+
+    /// Wire-friendly raw value. Useful for FIX-37-style external IDs.
+    #[inline(always)]
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Side {
-    Bid,
-    Ask,
+    Bid = 0,
+    Ask = 1,
 }
 
 /// Index into the slab.
@@ -732,7 +873,7 @@ impl MarketOrderResult {
 
 #[derive(Debug)]
 pub struct Fill {
-    pub resting_id: OrderId,
+    pub resting_id: OrderHandle,
     pub quantity: u64,
 }
 
