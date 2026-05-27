@@ -3,15 +3,24 @@ use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::errors::{BookError, BookResult};
-pub use crate::types::{MarketOrderResult, Price, Side};
 use crate::u64_map::U64Map;
+
+// Shared value types. `pub use` so `calvera_books::orderbook_2::{Price, Side,
+// MarketOrderResult}` keeps resolving for existing call sites.
+pub use crate::types::{MarketOrderResult, Price, Side};
 
 pub struct OrderBook<C: FillConsumer> {
     // compiler's existing cmov-style dispatch on the match side arms
-    // has better perf than [HalfBook; 2]
+    // has better perf than [HalfBook; 2].
+    //
+    // Each side owns its own `OrderSlab`. With a shared slab, an
+    // interleaved bid/ask allocation pattern lays out adjacent slots
+    // with mixed sides — a same-side chain walk loads cache lines that
+    // are half opposite-side data the matcher never reads. Per-side
+    // slabs pack same-side orders into the same lines for ~2× effective
+    // bid (or ask) density per cache line on bursty same-side allocs.
     bids: HalfBook,
     asks: HalfBook,
-    slab: OrderSlab,
     /// Fill sink. Bound at the type level — `C` is chosen by the binary that
     /// constructs the `OrderBook`. The matcher calls `consumer.on_fill(...)`
     /// once per fill; because `C` is a concrete type and `on_fill` is
@@ -33,17 +42,28 @@ pub enum MarketOrderMode {
 }
 
 impl<C: FillConsumer + Default> OrderBook<C> {
+    /// Construct a book with `slab_capacity` total slots split evenly
+    /// between bid and ask slabs (each side gets `slab_capacity / 2`).
+    /// For asymmetric workloads use `with_capacities`.
     pub fn new(slab_capacity: usize) -> Self {
         Self::with_consumer(slab_capacity, C::default())
+    }
+
+    pub fn with_capacities(bid_capacity: usize, ask_capacity: usize) -> Self {
+        Self::with_consumer_capacities(bid_capacity, ask_capacity, C::default())
     }
 }
 
 impl<C: FillConsumer> OrderBook<C> {
     pub fn with_consumer(slab_capacity: usize, consumer: C) -> Self {
+        let half = slab_capacity / 2;
+        Self::with_consumer_capacities(half, half, consumer)
+    }
+
+    pub fn with_consumer_capacities(bid_capacity: usize, ask_capacity: usize, consumer: C) -> Self {
         Self {
-            bids: HalfBook::new(Side::Bid),
-            asks: HalfBook::new(Side::Ask),
-            slab: OrderSlab::with_capacity(slab_capacity),
+            bids: HalfBook::with_capacity(Side::Bid, bid_capacity),
+            asks: HalfBook::with_capacity(Side::Ask, ask_capacity),
             consumer,
         }
     }
@@ -68,34 +88,65 @@ impl<C: FillConsumer> OrderBook<C> {
     /// linked `Order.next` pointers) and stitched across levels with one
     /// write per level boundary. The final chain is spliced into `free_head`
     /// once when the sweep ends.
+    /// Match the aggressor against the opposite side. Specialised on
+    /// `OPP_IS_ASK`:
+    ///
+    /// - `OPP_IS_ASK = true`  → aggressor is **Bid**, opposite is **Asks**.
+    /// - `OPP_IS_ASK = false` → aggressor is **Ask**, opposite is **Bids**.
+    ///
+    /// The const generic exists to eliminate every runtime branch on
+    /// side in the inlined body. With `OPP_IS_ASK` known at compile
+    /// time:
+    /// - `opposite` resolves to a single concrete field offset
+    ///   (`self.asks` or `self.bids`), no `csel`.
+    /// - `opp_side` resolves to a literal (`Side::Ask` or `Side::Bid`).
+    /// - The price-limit crossing comparison resolves to a single
+    ///   direction (`>=` or `<=`).
+    /// - The per-fill `OrderHandle::new(opp_side, ...)` side-bit shift
+    ///   folds to a constant `0` or `0x8000_0000_0000_0000`.
+    ///
+    /// Profile-driven: the runtime-side version bloated every caller's
+    /// stack frame by 48 B and spilled two callee-saved SIMD registers
+    /// because the materialised `opposite` ptr and precomputed side bit
+    /// stayed alive across the whole inlined body. See
+    /// `ideas/per_side_slab_result.md` for the asm analysis.
     #[inline(always)]
-    fn match_against_opposite(
+    fn match_against<const OPP_IS_ASK: bool>(
         &mut self,
-        side: Side,
         price_limit: Option<Price>,
         quantity: u64,
     ) -> BookResult<u64> {
-        // TODO: This function needs a cleanup
         let mut remaining = quantity;
         let mut freed_chain_head: Option<SlabIndex> = None;
         let mut freed_chain_tail: Option<SlabIndex> = None;
 
+        // Side of the resting orders the matcher emits handles for.
+        // Const after monomorphisation.
+        let opp_side: Side = if OPP_IS_ASK { Side::Ask } else { Side::Bid };
+
+        // Field offset known at compile time — no `csel`.
+        let opposite: &mut HalfBook = if OPP_IS_ASK {
+            &mut self.asks
+        } else {
+            &mut self.bids
+        };
+
         'sweep: while remaining > 0 {
             // 1) Best price on the opposite side.
-            let best_opposite = match side {
-                Side::Bid => self.asks.best_price,
-                Side::Ask => self.bids.best_price,
-            };
-            let fill_price = match best_opposite {
+            let fill_price = match opposite.best_price {
                 Some(p) => p,
                 None => break,
             };
 
             // 2) Limit-order stop condition: bail if our price no longer crosses.
+            //    Direction is const after monomorphisation: Bid aggressor
+            //    (opp_is_ask) crosses when `limit >= ask`, Ask aggressor
+            //    when `limit <= bid`.
             if let Some(limit) = price_limit {
-                let crosses = match side {
-                    Side::Bid => limit >= fill_price,
-                    Side::Ask => limit <= fill_price,
+                let crosses = if OPP_IS_ASK {
+                    limit >= fill_price
+                } else {
+                    limit <= fill_price
                 };
                 if !crosses {
                     break;
@@ -114,10 +165,11 @@ impl<C: FillConsumer> OrderBook<C> {
             let mut level_freed: Option<(SlabIndex, SlabIndex)> = None;
             let level_drained: bool;
             {
-                let level_opt = match side {
-                    Side::Bid => self.asks.levels.get_mut(&fill_price),
-                    Side::Ask => self.bids.levels.get_mut(&fill_price),
-                };
+                // Split borrow: `levels` and `slab` are sibling fields of
+                // `*opposite`. The inner loop reads + mutates the slab
+                // while `level` mutably borrows one entry of `levels`.
+                let slab = &mut opposite.slab;
+                let level_opt = opposite.levels.get_mut(&fill_price);
                 let level = match level_opt {
                     Some(l) => l,
                     None => break 'sweep, // best_price desync — defensive
@@ -134,9 +186,9 @@ impl<C: FillConsumer> OrderBook<C> {
                     // Read everything we need from the slot in one shot. After
                     // this we either fully consume (no slab write in this iter)
                     // or partially consume (one slab write at the end).
-                    let slot = &self.slab.slots[current_idx.as_usize()];
+                    let slot = &slab.slots[current_idx.as_usize()];
                     let resting_qty = slot.quantity;
-                    let resting_handle = OrderHandle::new(current_idx, slot.generation);
+                    let resting_handle = OrderHandle::new(opp_side, current_idx, slot.generation);
                     let next_idx = slot.next;
 
                     let fill_qty = remaining.min(resting_qty);
@@ -151,7 +203,7 @@ impl<C: FillConsumer> OrderBook<C> {
                         // (no link write — already linked via `Order.next`).
                         // Bump the slot's generation so any stale handle held
                         // by a consumer fails the cancel-time check.
-                        self.slab.bump_generation(current_idx);
+                        slab.bump_generation(current_idx);
                         consumed_qty += fill_qty;
                         consumed_count += 1;
                         level_last_freed = current_idx;
@@ -166,7 +218,7 @@ impl<C: FillConsumer> OrderBook<C> {
                                     // its stale `prev` (was pointing at the
                                     // now-freed `current_idx`) and settle
                                     // level counters once.
-                                    self.slab.slots[n.as_usize()].prev = None;
+                                    slab.slots[n.as_usize()].prev = None;
                                     level.head = Some(n);
                                     level.quantity -= consumed_qty;
                                     level.order_count -= consumed_count;
@@ -192,7 +244,7 @@ impl<C: FillConsumer> OrderBook<C> {
                         // new head; its `prev` may still point to a now-freed
                         // slot, so clear it unconditionally (cheaper than
                         // branching on whether anything was freed earlier).
-                        let s = &mut self.slab.slots[current_idx.as_usize()];
+                        let s = &mut slab.slots[current_idx.as_usize()];
                         s.quantity -= fill_qty;
                         s.prev = None;
                         consumed_qty += fill_qty;
@@ -217,7 +269,7 @@ impl<C: FillConsumer> OrderBook<C> {
             if let Some((lf_head, lf_tail)) = level_freed {
                 match freed_chain_tail {
                     Some(prev_tail) => {
-                        self.slab.slots[prev_tail.as_usize()].next = Some(lf_head);
+                        opposite.slab.slots[prev_tail.as_usize()].next = Some(lf_head);
                     }
                     None => {
                         freed_chain_head = Some(lf_head);
@@ -228,31 +280,22 @@ impl<C: FillConsumer> OrderBook<C> {
 
             // 5) If we fully drained the level, remove it from the half-book.
             if level_drained {
-                match side {
-                    Side::Bid => {
-                        self.asks.levels.remove(&fill_price);
-                        self.asks.price_index.remove(&fill_price);
-                        if self.asks.best_price == Some(fill_price) {
-                            self.asks.update_best_price();
-                        }
-                    }
-                    Side::Ask => {
-                        self.bids.levels.remove(&fill_price);
-                        self.bids.price_index.remove(&fill_price);
-                        if self.bids.best_price == Some(fill_price) {
-                            self.bids.update_best_price();
-                        }
-                    }
+                opposite.levels.remove(&fill_price);
+                opposite.price_index.remove(&fill_price);
+                if opposite.best_price == Some(fill_price) {
+                    opposite.update_best_price();
                 }
             }
         }
 
-        // 6) Splice the sweep's freed chain into the slab freelist. One write
-        //    to the chain tail's `next`, one update to `free_head`.
+        // 6) Splice the sweep's freed chain into the opposite slab's
+        //    freelist. One write to the chain tail's `next`, one update
+        //    to `free_head` on the same half-book. `opposite` is still
+        //    the hoisted borrow from the top of the function.
         if let Some(tail) = freed_chain_tail {
             let head = freed_chain_head.expect("invariant: head ⇒ tail");
-            self.slab.slots[tail.as_usize()].next = self.slab.free_head;
-            self.slab.free_head = Some(head);
+            opposite.slab.slots[tail.as_usize()].next = opposite.slab.free_head;
+            opposite.slab.free_head = Some(head);
         }
 
         Ok(remaining)
@@ -260,8 +303,8 @@ impl<C: FillConsumer> OrderBook<C> {
 
     // (1) Match against the opposite side up to `price`
     // (2) Rest any unfilled remainder on our own side
-    //     (a) Insert order in slab
-    //     (b) Update price level and slab links
+    //     (a) Alloc slot in the own-side slab, write the order fields
+    //     (b) Update price level + slab links via the own HalfBook
     //     (c) Return the engine-assigned `OrderHandle` to the caller
     pub fn add_limit_order(
         &mut self,
@@ -270,27 +313,36 @@ impl<C: FillConsumer> OrderBook<C> {
         quantity: u64,
     ) -> BookResult<Option<OrderHandle>> {
         // Limit semantics: stop matching when price no longer crosses.
-        let remaining = self.match_against_opposite(side, Some(price), quantity)?;
+        // Dispatch once on aggressor side and select the matcher
+        // monomorph that has the opposite side baked in.
+        let remaining = match side {
+            Side::Bid => self.match_against::<true>(Some(price), quantity)?,
+            Side::Ask => self.match_against::<false>(Some(price), quantity)?,
+        };
 
+        // Dispatch on side at the call site so each arm operates on a
+        // concrete sibling field (self.bids / self.asks) rather than on
+        // a runtime-materialised `&mut HalfBook`. Constructing the
+        // `OrderHandle` inside each arm with a literal side lets the
+        // side-bit shift fold to a constant — no `csel`, no early
+        // materialisation, no stack spill for the side bit.
+        //
+        // The asm diff showed that the previous "let own = match side
+        // { ... }" pattern grew the stack frame by 48 B and spilled two
+        // SIMD registers because `own` and the precomputed side-bit had
+        // to be kept alive across the whole function. This shape keeps
+        // dispatch at the leaves where the optimiser can see through.
         let handle = if remaining > 0 {
-            let (order_idx, generation) = self.slab.alloc_slot()?;
-            let slot = self.slab.get_mut(order_idx);
-            slot.price = price;
-            slot.quantity = remaining;
-            slot.prev = None;
-            slot.next = None;
-            slot.side = side;
-
             match side {
-                Side::Ask => self
-                    .asks
-                    .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
-                Side::Bid => self
-                    .bids
-                    .push_order_to_l2_book_and_update_slab_links(order_idx, &mut self.slab),
-            };
-
-            Some(OrderHandle::new(order_idx, generation))
+                Side::Bid => {
+                    let (order_idx, generation) = self.bids.alloc_and_rest(price, remaining)?;
+                    Some(OrderHandle::new(Side::Bid, order_idx, generation))
+                }
+                Side::Ask => {
+                    let (order_idx, generation) = self.asks.alloc_and_rest(price, remaining)?;
+                    Some(OrderHandle::new(Side::Ask, order_idx, generation))
+                }
+            }
         } else {
             None
         };
@@ -299,36 +351,29 @@ impl<C: FillConsumer> OrderBook<C> {
         Ok(handle)
     }
 
-    // (1) Decode handle → (idx, generation); reject stale handles via the
-    //     per-slot generation check (no hashmap probe)
-    // (2) Read side + price from the slot (was kept in `order_index`)
+    // (1) Decode handle → (side, idx, generation); reject stale handles
+    //     via the per-slot generation check (no hashmap probe)
+    // (2) Read price from the slot (still needed to find the level)
     // (3) Unlink from price level (stitch prev/next, drop level if empty)
     // (4) Return slot to freelist (bumps generation, invalidating the handle)
     pub fn cancel_limit_order(&mut self, handle: OrderHandle) -> BookResult<()> {
         let idx = handle.idx();
         let generation = handle.generation();
+        let side = handle.side();
 
-        let slot = &self.slab.slots[idx.as_usize()];
+        let own: &mut HalfBook = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+
+        let slot = &own.slab.slots[idx.as_usize()];
         if slot.generation != generation {
             return Err(BookError::OrderNotFound);
         }
-        let side = slot.side;
         let price = slot.price;
 
-        match side {
-            Side::Bid => self.bids.remove_order_from_l2_book_and_update_slab_links(
-                idx,
-                price,
-                &mut self.slab,
-            ),
-            Side::Ask => self.asks.remove_order_from_l2_book_and_update_slab_links(
-                idx,
-                price,
-                &mut self.slab,
-            ),
-        };
-
-        self.slab.free(idx);
+        own.remove_order_from_l2_book_and_update_slab_links(idx, price);
+        own.slab.free(idx);
 
         Ok(())
     }
@@ -376,7 +421,11 @@ impl<C: FillConsumer> OrderBook<C> {
         }
 
         // Market = sweep unconditionally → price_limit = None.
-        let remaining = self.match_against_opposite(side, None, quantity)?;
+        // Same per-side dispatch pattern as add_limit_order.
+        let remaining = match side {
+            Side::Bid => self.match_against::<true>(None, quantity)?,
+            Side::Ask => self.match_against::<false>(None, quantity)?,
+        };
 
         self.consumer.flush();
         Ok(MarketOrderResult { remaining })
@@ -388,27 +437,55 @@ pub struct HalfBook {
     levels: U64Map<Price, PriceLevel>,
     price_index: BTreeSet<Price>, // sorted; only walked on level drain
     best_price: Option<Price>,
+    // Each `HalfBook` owns the slab for its side. With sufficient
+    // same-side burstiness (MM stacks, replenishment after sweeps),
+    // adjacent slab indices belong to the same side and share cache
+    // lines under the 32-byte Order layout — ~2× line density vs a
+    // shared slab where bid/ask slots interleave.
+    slab: OrderSlab,
 }
 
 impl HalfBook {
-    fn new(side: Side) -> Self {
+    fn with_capacity(side: Side, capacity: usize) -> Self {
         Self {
             side,
             levels: U64Map::default(),
             price_index: BTreeSet::new(),
             best_price: None,
+            slab: OrderSlab::with_capacity(capacity),
         }
+    }
+
+    /// Alloc a fresh slot in this side's slab, write the order fields,
+    /// and link it into the side's L2 book. Returns the `(idx, gen)`
+    /// pair the caller needs to build the `OrderHandle`.
+    ///
+    /// Marked `#[inline]` so add_limit_order's per-arm call site sees
+    /// the full body and the optimiser can hoist common subexpressions
+    /// across the alloc + write + push sequence.
+    #[inline]
+    fn alloc_and_rest(
+        &mut self,
+        price: Price,
+        quantity: u64,
+    ) -> BookResult<(SlabIndex, NonZeroU32)> {
+        let (idx, generation) = self.slab.alloc_slot()?;
+        let slot = self.slab.get_mut(idx);
+        slot.price = price;
+        slot.quantity = quantity;
+        slot.prev = None;
+        slot.next = None;
+        self.push_order_to_l2_book_and_update_slab_links(idx);
+        Ok((idx, generation))
     }
 
     /// (1) Update price level and stich slab links
     /// (2) Remove price level if empty (-price_index)
     /// (3) Refresh best price
-    fn remove_order_from_l2_book_and_update_slab_links(
-        &mut self,
-        idx: SlabIndex,
-        price: Price,
-        slab: &mut OrderSlab,
-    ) {
+    fn remove_order_from_l2_book_and_update_slab_links(&mut self, idx: SlabIndex, price: Price) {
+        // Split borrow: `levels` and `slab` are sibling fields of `self`,
+        // so the borrow checker permits separate mutable borrows.
+        let slab = &mut self.slab;
         if let Some(level) = self.levels.get_mut(&price) {
             level.remove(idx, slab);
 
@@ -434,17 +511,19 @@ impl HalfBook {
     /// (1) Get or insert price level (+price index)
     /// (2) Push order to price level and update links
     /// (3) Refresh new best
-    fn push_order_to_l2_book_and_update_slab_links(
-        &mut self,
-        idx: SlabIndex,
-        slab: &mut OrderSlab,
-    ) {
+    fn push_order_to_l2_book_and_update_slab_links(&mut self, idx: SlabIndex) {
+        // Split borrow: bind each sibling field separately so the
+        // `or_insert_with` closure (which captures `price_index`) does
+        // not conflict with the `levels.entry(...)` mutable borrow.
+        let slab = &mut self.slab;
+        let levels = &mut self.levels;
+        let price_index = &mut self.price_index;
         let price = slab.get(idx).price;
 
         // Get or insert level
-        let level = self.levels.entry(price).or_insert_with(|| {
+        let level = levels.entry(price).or_insert_with(|| {
             // Add new price set
-            self.price_index.insert(price);
+            price_index.insert(price);
 
             // Insert new price level
             PriceLevel::new(price)
@@ -587,8 +666,7 @@ impl OrderSlab {
             prev: None,
             next: None,
             generation: gen_one,
-            side: Side::Bid,
-            _pad: [0; 3],
+            _pad: [0; 4],
         });
 
         // slots[1..=capacity]: freelist 1 -> 2 -> … -> capacity -> None.
@@ -607,8 +685,7 @@ impl OrderSlab {
                 prev: None,
                 next: next_free,
                 generation: gen_one,
-                side: Side::Bid,
-                _pad: [0; 3],
+                _pad: [0; 4],
             });
         }
 
@@ -634,14 +711,16 @@ impl OrderSlab {
     /// outstanding `OrderHandle` for the previous occupant fails the
     /// cancel-time check. ABA defence.
     ///
-    /// Wraps from `u32::MAX → 1`, skipping `0` to keep the `NonZeroU32`
-    /// invariant.
+    /// Generation lives in 31 bits — the top bit of the handle's
+    /// generation field is the side flag. Wraps from `0x7FFF_FFFF → 1`,
+    /// skipping `0` to keep the `NonZeroU32` invariant.
     #[inline(always)]
     pub fn bump_generation(&mut self, idx: SlabIndex) {
         let slot = &mut self.slots[idx.as_usize()];
-        let new_gen = slot.generation.get().wrapping_add(1);
-        let new_gen = if new_gen == 0 { 1 } else { new_gen };
-        // SAFETY: new_gen is non-zero by the branch above.
+        let next = slot.generation.get().wrapping_add(1) & OrderHandle::GEN_MASK;
+        let new_gen = if next == 0 { 1 } else { next };
+        // SAFETY: new_gen is non-zero by the branch above, and `& GEN_MASK`
+        // keeps it within 31 bits.
         slot.generation = unsafe { NonZeroU32::new_unchecked(new_gen) };
     }
 
@@ -688,12 +767,15 @@ impl OrderSlab {
 /// straddle, regardless of `Vec` size or allocator.
 ///
 /// Layout (32 B total): `price` (8) + `quantity` (8) + `prev` (4) +
-/// `next` (4) + `generation` (4) + `side` (1) + `_pad` (3). The
-/// engine-assigned `OrderHandle` is `(generation, slab_index)` — the
-/// index from the slot's position in the slab, the generation from the
-/// field below — so no `order_id` field is needed on the slot. `side`
-/// lives on the order because the slab is shared between bids and asks;
-/// cancel reads it from the slot after the generation check.
+/// `next` (4) + `generation` (4) + `_pad` (4).
+///
+/// `side` is no longer stored on the slot. Each `HalfBook` owns its own
+/// `OrderSlab`, so the side an order belongs to is implicit in which slab
+/// it lives in. The `OrderHandle` carries a side bit, and cancel routes
+/// to the correct half-book by reading that bit directly — no slot read
+/// required for routing. This frees a byte; whether it returns as
+/// additional pad (current) or a future field is a layout decision the
+/// 32-byte cache-line commitment outlasts.
 #[repr(C, align(32))]
 #[derive(Debug, Clone)]
 pub struct Order {
@@ -708,8 +790,7 @@ pub struct Order {
     // cancel-time check rejects any handle whose generation no longer
     // matches the slot's — ABA defence.
     pub generation: NonZeroU32,
-    pub side: Side,
-    _pad: [u8; 3],
+    _pad: [u8; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<Order>() == 32);
@@ -717,10 +798,22 @@ const _: () = assert!(std::mem::align_of::<Order>() == 32);
 
 /// Engine-assigned, opaque order handle.
 ///
-/// Packed `(generation, slab_index)`: generation in the high 32 bits,
-/// slab index in the low 32. Decoding is two shifts and a mask — no hash
-/// lookup. The outer `NonZeroU64` lets `Option<OrderHandle>` niche-pack
-/// to 8 bytes (the all-zero pattern becomes `None`).
+/// Packed `[side: 1][generation: 31][slab_index: 32]`:
+/// - bit 63: side (0 = Bid, 1 = Ask)
+/// - bits 32..63: generation (31 bits, NonZero)
+/// - bits 0..32: slab index (NonZeroU32)
+///
+/// Side moved onto the handle (was: read from `Order.side` on the slot)
+/// so cancel can route to the correct per-side slab with no slot read.
+/// Each `HalfBook` owns its own `OrderSlab` — slab ownership *is* the
+/// side. Generation gives up its top bit; 2³¹ generations per slot is
+/// still far beyond what ABA defence needs. The outer `NonZeroU64` lets
+/// `Option<OrderHandle>` niche-pack to 8 bytes.
+///
+/// Generation mask: producers (`bump_generation`) must keep generation
+/// in `[1, 0x7FFF_FFFF]`. Consumers (`OrderHandle::generation`) mask the
+/// top bit on read so a fabricated handle with a side bit set doesn't
+/// leak into the generation value.
 ///
 /// # Provenance is part of the safety contract
 ///
@@ -738,42 +831,44 @@ const _: () = assert!(std::mem::align_of::<Order>() == 32);
 /// `cancel_limit_order` sound. The three failure modes that are NOT
 /// caught by the generation check, and why the contract matters:
 ///
-/// 1. **Generation wraparound.** After ~4 billion frees of the *same*
-///    slot, gen cycles through `1..=u32::MAX` and returns to a
-///    previously-issued value. A handle sitting around for 2³² cycles
-///    of its specific slot could match the slot's current gen again.
-///    Practically unreachable — even at one free per nanosecond per
-///    slot that's ~136 years per slot — but the type-level guarantee is
-///    "u32 of generation space," not infinite.
+/// 1. **Generation wraparound.** After 2³¹ frees of the *same* slot,
+///    gen cycles through `1..=0x7FFF_FFFF` and returns to a
+///    previously-issued value. Practically unreachable — even at one
+///    free per nanosecond per slot that's ~68 years per slot.
 ///
 /// 2. **Out-of-range `idx`.** If a caller manufactures or corrupts a
-///    handle with `idx > slab.capacity`, the
-///    `self.slab.slots[idx.as_usize()]` access in `cancel_limit_order`
-///    panics *before* the generation check runs. Failure mode for
-///    malformed handles is therefore "panic," not "OrderNotFound."
-///    Fine for opaque, engine-issued handles; would need an explicit
-///    bounds check if the API ever accepted untrusted handles (e.g.
-///    deserialised over a network from another process).
+///    handle with `idx > slab.capacity`, the slab indexing in
+///    `cancel_limit_order` panics before the generation check runs.
+///    Failure mode for malformed handles is therefore "panic," not
+///    "OrderNotFound." Fine for opaque, engine-issued handles.
 ///
 /// 3. **Never-allocated slot.** All slots are initialised with
-///    `gen = 1`. If a caller fabricates `OrderHandle { idx, gen: 1 }`
-///    for an `idx` that has never been allocated, the gen check passes
-///    (slot.gen and handle.gen both equal 1). `cancel_limit_order` then
-///    reads garbage `side`/`price` from the slot, probably no-ops
-///    against a non-existent level, then calls `free` — which bumps
-///    gen and pushes the slot onto the freelist, **corrupting the
-///    freelist by double-linking** (the slot was already there from
-///    initialisation). Same root cause as (2): doesn't happen with
-///    engine-issued handles, but the safety property is "the engine
+///    `gen = 1`. A fabricated handle with `gen = 1` for an unallocated
+///    `idx` passes the gen check and then `free` corrupts the freelist.
+///    Same root cause as (2): the safety property is "the engine
 ///    controls all handles," not "any 8 bytes are safe to pass."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderHandle(NonZeroU64);
 
 impl OrderHandle {
+    /// Bit position of the side flag inside the packed u64.
+    const SIDE_BIT: u64 = 1 << 63;
+    /// Mask covering the 31-bit generation field once shifted into place.
+    const GEN_MASK: u32 = 0x7FFF_FFFF;
+
     #[inline(always)]
-    pub fn new(idx: SlabIndex, generation: NonZeroU32) -> Self {
-        let packed = ((generation.get() as u64) << 32) | (idx.0.get() as u64);
-        // SAFETY: both halves are NonZero, so the packed value is non-zero.
+    pub fn new(side: Side, idx: SlabIndex, generation: NonZeroU32) -> Self {
+        // generation must fit in 31 bits — enforced by `bump_generation`,
+        // which wraps at 0x7FFF_FFFF. Debug-only check; producers always
+        // satisfy this.
+        debug_assert!(
+            generation.get() <= Self::GEN_MASK,
+            "generation must fit in 31 bits (top bit reserved for side)"
+        );
+        let side_bit = (side as u64) << 63;
+        let packed = side_bit | ((generation.get() as u64) << 32) | (idx.0.get() as u64);
+        // SAFETY: idx is NonZeroU32, so the low 32 bits are non-zero,
+        // making the whole packed value non-zero regardless of side.
         Self(unsafe { NonZeroU64::new_unchecked(packed) })
     }
 
@@ -786,9 +881,19 @@ impl OrderHandle {
 
     #[inline(always)]
     pub fn generation(self) -> NonZeroU32 {
-        let hi = (self.0.get() >> 32) as u32;
-        // SAFETY: constructed from a NonZeroU32 in the high half.
+        // Mask off the side bit before reading generation.
+        let hi = ((self.0.get() >> 32) as u32) & Self::GEN_MASK;
+        // SAFETY: producers ensure generation is in [1, 0x7FFF_FFFF].
         unsafe { NonZeroU32::new_unchecked(hi) }
+    }
+
+    #[inline(always)]
+    pub fn side(self) -> Side {
+        if self.0.get() & Self::SIDE_BIT != 0 {
+            Side::Ask
+        } else {
+            Side::Bid
+        }
     }
 
     /// Wire-friendly raw value. Useful for FIX-37-style external IDs.
