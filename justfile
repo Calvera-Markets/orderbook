@@ -42,56 +42,52 @@ test *FLAGS:
 # Benchmarks (criterion — see BENCHMARKS.md)
 # ---------------------------------------------------------------------------
 
-# Run all benches. Pass `--quick` for a fast pass.
+# Run the framework bench (one binary, every (impl × workload) combo).
+# Pass `--quick` for a fast pass, or filter args like `v1/mixed`.
 benches *FLAGS:
     @mkdir -p benches/logs
     @LOG="benches/logs/bench-$(date +%Y%m%d-%H%M%S).log"; \
      echo "→ logging to $LOG"; \
-     cargo bench -p calvera-books --bench hmap_book -- {{FLAGS}} 2>&1 | tee "$LOG"
+     cargo bench -p calvera-books --bench engine -- {{FLAGS}} 2>&1 | tee "$LOG"
 
-# v2 benches: same workloads but matcher publishes fills into a Calvera
-# Disruptor (cross-thread SPSC ring) instead of pushing into a Vec<Fill>.
-# See benches/hmap_book_disruptor.rs.
-benches-disruptor *FLAGS:
-    @mkdir -p benches/logs
-    @LOG="benches/logs/bench-disruptor-$(date +%Y%m%d-%H%M%S).log"; \
-     echo "→ logging to $LOG"; \
-     cargo bench -p calvera-books --bench hmap_book_disruptor -- {{FLAGS}} 2>&1 | tee "$LOG"
-
-# v3 benches: matcher buffers fills per-operation and emits them via one
-# `batch_publish` at the end of each operation. Amortizes Disruptor slot-
-# claim cost across all fills in an op. See benches/hmap_book_disruptor_batched.rs.
+# Disruptor-batched bench (different consumer, separate bench binary).
+# The framework's M4 consumer-axis sweep will eventually absorb this.
 benches-disruptor-batched *FLAGS:
     @mkdir -p benches/logs
     @LOG="benches/logs/bench-disruptor-batched-$(date +%Y%m%d-%H%M%S).log"; \
      echo "→ logging to $LOG"; \
-     cargo bench -p calvera-books --bench hmap_book_disruptor_batched -- {{FLAGS}} 2>&1 | tee "$LOG"
+     cargo bench -p calvera-books --bench orderbook_disruptor_batched -- {{FLAGS}} 2>&1 | tee "$LOG"
 
-# Run a single bench by name. Example: just bench-one limit_rest/single_level
+# Aggregate the most recent criterion results into one JSON + CSV under
+# benches/logs/, tagged with host metadata. Run after `just benches`.
+report:
+    cargo run --release --quiet --example report
+
+# Run a single bench id. Example: just bench-one v1/mixed
 bench-one NAME *FLAGS:
     @mkdir -p benches/logs
     @SAFE_NAME=$(echo "{{NAME}}" | tr '/' '_'); \
      LOG="benches/logs/bench-${SAFE_NAME}-$(date +%Y%m%d-%H%M%S).log"; \
      echo "→ logging to $LOG"; \
-     cargo bench -p calvera-books --bench hmap_book -- {{NAME}} {{FLAGS}} 2>&1 | tee "$LOG"
+     cargo bench -p calvera-books --bench engine -- {{NAME}} {{FLAGS}} 2>&1 | tee "$LOG"
 
 
-# Capture all 6 flamegraphs
+# Capture a flamegraph for every (workload × variant) combo in capture-flamegraphs.sh
 profile-all:
     ./bin/capture-flamegraphs.sh
 
-# Open the Firefox Profiler interactive view for a single mode.
-# Modes: rest-single, rest-spread, match-single, sweep-limit, sweep-market, cancel.
-# Example: just profile-view rest-single 20
-profile-view MODE DURATION="20":
-    ./bin/view-samply.sh {{MODE}} {{DURATION}}
+# Open the Firefox Profiler interactive view for a single (workload × variant).
+# Workloads: mixed, add_cancel.  Variants: v1, v2.
+# Example: just profile-view mixed v1 20
+profile-view WORKLOAD VARIANT DURATION="20":
+    ./bin/view-samply.sh {{WORKLOAD}} {{VARIANT}} {{DURATION}}
 
-# Open a flamegraph SVG (from the latest run)
-# Example: just flamegraph rest-single
-flamegraph MODE:
+# Open a flamegraph SVG (from the latest run). Tag format: <variant>-<workload>.
+# Example: just flamegraph v1-mixed
+flamegraph TAG:
     @LATEST=$(ls -t profiling/flamegraph/ 2>/dev/null | head -1); \
      if [ -z "$LATEST" ]; then \
         echo "no runs found — run \`just profile-all\` first"; exit 1; \
      fi; \
      echo "→ opening run $LATEST"; \
-     open "profiling/flamegraph/$LATEST/flamegraph-{{MODE}}.svg"
+     open "profiling/flamegraph/$LATEST/flamegraph-{{TAG}}.svg"

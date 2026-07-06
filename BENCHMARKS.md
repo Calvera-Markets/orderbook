@@ -1,174 +1,185 @@
 # calvera-books — Benchmarks
 
-Numbers for the `OrderBook` implementation, collected with criterion 0.8. The
-"current" column tracks the latest version (v0.0.6 — see [`CHANGELOG.md`](CHANGELOG.md)
-for the per-version code/perf walkthrough).
+Numbers for the `OrderBook` engines, collected with criterion 0.8 through the
+generic bench framework (`benches/engine.rs`). Two implementations are measured
+side by side:
 
-All times below are the **median** of a 100-sample run. Each iteration runs
-against a fresh book (criterion's `iter_batched`), so setup time is excluded
-from the measurement.
+- **v1** — `orderbook` (shared slab, engine-assigned `OrderHandle`)
+- **v2** — `orderbook_2` (per-side slab, side-packed handle)
 
-## Current baseline (v0.0.6)
+Both implement `OrderBookApi`, so one runner drives both and criterion's
+baseline machinery compares `v1/<workload>` against `v2/<workload>` 1:1. See
+[`BENCH_FRAMEWORK_PLAN.md`](BENCH_FRAMEWORK_PLAN.md) for the framework design and
+[`CHANGELOG.md`](CHANGELOG.md) for the per-version optimization history of the
+engine itself.
 
-Bench harness: `benches/orderbook.rs` (`cargo bench -p calvera-books --bench
-orderbook`). Slab capacity: 1 MiB (`SLAB_CAP = 1 << 20`). Consumer:
-`VecConsumer` (appends every fill to a `Vec<Fill>`).
+## Methodology — warm, steady-state measurement
 
-| Benchmark                          | Median    | Per-element / per-level    |
-| ---------------------------------- | --------- | -------------------------- |
-| `limit_rest/single_level`          | 74.0 ns   | one insert, empty book     |
-| `limit_rest/spread_levels`         | 78.7 ns   | one insert, 1000-level book |
-| `limit_match_single/full_consume`  | 69.1 ns   | one full-consume match     |
-| `limit_sweep_levels/4`             | 99.1 ns   | ~25 ns / level             |
-| `limit_sweep_levels/16`            | 476 ns    | ~30 ns / level             |
-| `limit_sweep_levels/64`            | 1.59 µs   | ~25 ns / level             |
-| `limit_sweep_levels/256`           | 6.64 µs   | ~26 ns / level             |
-| `market_sweep/4`                   | 94.2 ns   | ~24 ns / level             |
-| `market_sweep/16`                  | 445 ns    | ~28 ns / level             |
-| `market_sweep/64`                  | 1.47 µs   | ~23 ns / level             |
-| `market_sweep/256`                 | 6.35 µs   | ~25 ns / level             |
-| `market_sweep_opl/L256xO1`         | 6.25 µs   | ~24 ns / fill (OPL=1)      |
-| `market_sweep_opl/L64xO4`          | 1.93 µs   | ~7.5 ns / fill (OPL=4)     |
-| `market_sweep_opl/L16xO16`         | 1.09 µs   | ~4.2 ns / fill (OPL=16)    |
-| `market_sweep_opl/L4xO64`          | 936 ns    | ~3.7 ns / fill (OPL=64)    |
-| `cancel/mid_book` *(see note)*     | 31.1 ns   | O(1) cancel                |
-| `mixed_workload/random_add_cancel` | 6.09 µs   | ~5.9 ns / op (1024 ops)    |
+The old harness built a fresh 1 MiB book per iteration (`iter_batched`); setup
+was "untimed", but the **first touch** of those pages happened inside the timed
+body — a one-off allocator/page-fault cost that isn't engine work and varies 4×
+across page sizes (see [`lessons/pages.md`](lessons/pages.md)). The framework
+fixes this:
 
-*Note on `cancel/mid_book`*: under criterion's default `BatchSize::LargeInput`,
-v0.0.6 cancel is below the timer-resolution floor — criterion reports "took
-zero time per iteration." The 31.1 ns figure is from a `--measurement-time
-15 --sample-size 100` re-run (full log:
-`benches/logs/bench-v2-cancel-confirm-*.log`). Confidence interval
-[29.6, 33.2] ns, no overlap with the v0.0.5 [49.6, 52.7] ns interval from
-the matching re-run.
+- Each workload is a `(setup, hot)` pair. `setup` builds a pre-allocated,
+  pre-populated book **once**; a warmup phase runs `hot` untimed to soft-prefault
+  slab pages and warm HashMap buckets; only the steady-state `hot` loop is timed
+  via criterion's `iter_custom`.
+- Workloads hold the book at a bounded size (add/cancel balanced, or periodic
+  refill), so an arbitrarily long timed run never drifts or exhausts the slab.
 
-## v0.0.1 → v0.0.6
+**Read a number as the cost of one `hot` iteration**, whose op composition
+varies per workload (spelled out below) — it is *not* a uniform per-op figure.
 
-Initial implementation against latest. Same machine, identical bench harness,
-`VecConsumer` on both sides. Per-version detail (what each step changed and
-why) lives in [`CHANGELOG.md`](CHANGELOG.md).
+### Running
 
-| Benchmark                          | v0.0.1    | v0.0.6   | Δ        |
-| ---------------------------------- | --------- | -------- | -------- |
-| `limit_rest/single_level`          | 2.84 µs   | 74.0 ns  | **−97%** |
-| `limit_rest/spread_levels`         | 2.74 µs   | 78.7 ns  | **−97%** |
-| `limit_match_single/full_consume`  | 244 ns    | 69.1 ns  | **−72%** |
-| `limit_sweep_levels/4`             | 345 ns    | 99.1 ns  | **−71%** |
-| `limit_sweep_levels/16`            | 1.34 µs   | 476 ns   | **−64%** |
-| `limit_sweep_levels/64`            | 5.49 µs   | 1.59 µs  | **−71%** |
-| `limit_sweep_levels/256`           | 21.67 µs  | 6.64 µs  | **−69%** |
-| `market_sweep/4`                   | 343 ns    | 94.2 ns  | **−73%** |
-| `market_sweep/16`                  | 1.36 µs   | 445 ns   | **−67%** |
-| `market_sweep/64`                  | 5.47 µs   | 1.47 µs  | **−73%** |
-| `market_sweep/256`                 | 21.83 µs  | 6.35 µs  | **−71%** |
-| `market_sweep_opl/L256xO1`         | 21.78 µs  | 6.25 µs  | **−71%** |
-| `market_sweep_opl/L64xO4`          | 15.90 µs  | 1.93 µs  | **−88%** |
-| `market_sweep_opl/L16xO16`         | 13.37 µs  | 1.09 µs  | **−92%** |
-| `market_sweep_opl/L4xO64`          | 12.20 µs  | 936 ns   | **−92%** |
-| `cancel/mid_book` *(see note)*     | 127 ns    | 31.1 ns  | **−76%** |
-| `mixed_workload/random_add_cancel` | 47.92 µs  | 6.09 µs  | **−87%** |
+```
+cargo bench --bench engine                 # all workloads × {v1, v2}
+just bench-one v1/mixed                     # a single id
+just report                                 # → benches/logs/results-<ts>.{json,csv}
+BENCH_SLAB_CAP=1<<18 cargo bench --bench engine   # override slab capacity
+BENCH_SLAB_ALLOC=madvise cargo bench --bench engine  # Linux-only allocator axis
+```
 
-*Note on `cancel/mid_book`*: the v0.0.1 number (127 ns) is **with the slab-slot
-leak fixed** — pre-fix v0.0.1 reported 91 ns because it was skipping
-`slab.free` (the slot was leaked), so it was doing strictly less work. The
-fix landed in v0.0.2. The v0.0.6 number is from a longer-measurement re-run
-(see the current-baseline note above) because the default-config measurement
-falls below the timer-resolution floor.
+Bench ids encode every non-default axis so baselines don't collide:
+`impl/workload[/cap_<N>][/alloc_<slug>]`. `just report` flattens criterion's
+per-bench `estimates.json` into one host-tagged JSON + CSV, so cross-host
+comparison is a `diff`.
 
-## What each bench measures
+## Current results
 
-### `limit_rest`
+Apple Silicon (aarch64), macOS; criterion 0.8, warm-up 1 s / measurement 3 s.
+`VecConsumer` on both variants. Each figure is the **mean of the medians of
+three runs** — single-run medians drift a few percent (see the noise note), so
+averaging gives a steadier point estimate.
 
-Pure insert path — no matching happens because the opposite side is empty (or
-non-crossing). Measures the cost of `match_against_opposite` returning
-immediately, plus slab allocation, intrusive-list link patching, and
-`order_index` HashMap insertion.
+| Workload          | v1 avg   | v2 avg   | `hot` iteration                                   |
+| ----------------- | -------: | -------: | ------------------------------------------------- |
+| `mixed`           |  6.49 ns |  6.29 ns | one add *or* cancel (50/50), populated book        |
+| `add_cancel`      | 11.25 ns | 11.02 ns | one add *or* cancel, alternating (book holds 0–1)  |
+| `cancel_heavy`    | 10.12 ns |  9.82 ns | add-tail + cancel-head on a 50-deep single level   |
+| `match_single`    | 22.41 ns | 21.51 ns | add-tail + full-consume match-head at one level    |
+| `add_spread`      | 49.79 ns | 48.24 ns | add + cancel, each creating/draining a level (BTreeSet) |
+| `sweep` *(noisy)* | 395.7 ns | 388.9 ns | one market order draining 8 levels (~50 ns/level)  |
+| `deep_book`       | 56.03 µs | 52.79 µs | sweep + rebuild the ~5 K-order near band of a deep power-law book |
+| `calm_market`     | 30.63 ns | 31.29 ns | one scenario event (OU + MM cancel/replace)        |
+| `news_event`      | 30.57 ns | 31.76 ns | one scenario event (calm + rare Student-t jumps)   |
+| `illiquid`        | 33.59 ns | 32.18 ns | one scenario event (wide spread, thin, aggressive) |
+| `opening_auction` | 28.42 ns | 30.94 ns | one scenario event (deep resting book)             |
 
-- **`single_level`** — fresh book, each iter adds one bid at the same price.
-  Stresses the "new price level" path: every iteration creates a level, inserts
-  one order, and registers in `order_index`.
-- **`spread_levels`** — fresh book, each iter adds one bid at a price drawn from
-  a 1000-tick range. Stresses the HashMap-of-levels growing wide; the
-  `BTreeSet` price index sees a lot of inserts.
+On the shallow workloads v1 and v2 track within a few percent — smaller than the
+run-to-run noise on most of them, so neither is a clear winner *at those book
+sizes*. (v2 edges the micro-workloads; v1 edges most scenarios; both within
+noise.) **`deep_book` is the exception**: with a ~382 KiB working set that
+exceeds L1 and a ~5 K-order same-side chain walked per iter, v2 is ~6% faster
+(and steadier) — the first workload where its per-side slab packing clearly
+pays off. See the [`deep_book`](#deep_book--power-law-depth-profile) note below.
 
-### `limit_match_single/full_consume`
+## v1 vs v2 — which to use
 
-The minimum-work matching case: one ask of qty 1 resting at p=100, an aggressor
-bid of qty 1 at p=100. The aggressor consumes the resting order exactly,
-triggering the full-consume branch (level walk → drain → `order_index.remove`,
-`slab.free` deferred to end-of-sweep splice). This is the floor for a single
-match.
+Both engines are the same design (BTreeSet price index + level map + intrusive
+FIFO + generational slab handle); v2 differs only in three cache/branch
+optimizations — a **per-side slab**, a **side-packed handle**, and a
+**const-generic matcher** specialized on side. See `CHANGELOG.md` for the detail.
 
-### `limit_sweep_levels/{4,16,64,256}`
+The benchmarks say those optimizations are **scale-dependent**:
 
-Book pre-populated with N bid + N ask price levels around mid 10_000, **one
-order per level**, qty 1 each. The aggressor is a bid with price at the top of
-the asks and qty=N — so it walks every ask level, fully consuming each one in
-turn.
+- **Typical / shallow books** (working set fits in L1 — every workload here
+  except `deep_book`): v1 and v2 are interchangeable. Gaps are a few percent in
+  either direction and smaller than run-to-run noise. Pick either.
+- **Deep, liquid, same-side-bursty books** (working set past L1, long same-side
+  chains walked per op — `deep_book`): **v2 wins by ~6%, repeatably.** Its
+  per-side slab keeps a swept chain dense in cache where v1's shared slab has it
+  interleaved with the opposite side, doubling the cache lines touched.
 
-This is the **primary throughput benchmark for the matching loop**. Per-level
-cost trends from ~33 ns at /4 to ~36 ns at /256 — the higher levels pay
-slightly more in TLB / L1 pressure as the working set grows.
+Rule of thumb: **default to v2** — it matches v1 when the book is small and pulls
+ahead when it's deep, so it never loses meaningfully and wins where it counts.
+The tie at small sizes also means v1's simpler shared slab remains a fine choice
+if you value that; the two exist side by side precisely so this trade-off is
+measured, not assumed.
 
-### `market_sweep/{4,16,64,256}`
+## What each workload measures
 
-Identical book setup to `limit_sweep_levels`, but submits a market IOC instead
-of a crossing limit. Confirms that both paths go through
-`match_against_opposite` — numbers track `limit_sweep_levels` within ~3% at
-every depth.
+Micro-workloads isolate single code paths; scenario workloads (M6) replay
+realistic event streams. Definitions live in `workloads.rs` /`scenarios.rs`
+(single source of truth, shared by the bench runner, the profiler, and tests).
 
-### `market_sweep_opl/L{256xO1, 64xO4, 16xO16, 4xO64}`
+### Micro-workloads
 
-**Total fills fixed at 256, varying levels × orders-per-level.** Tests the
-amortisation of the per-level matcher work over the orders consumed at each
-level. At OPL=1 every "level walk" runs a single fill then drains; at OPL=64 a
-single level walk consumes 64 fills under one hashmap lookup, one
-level-bookkeeping update, and one freelist stitch.
+- **`mixed`** — book pre-populated to ~400 resting orders (50 levels/side);
+  1024 precomputed random ops at a 50/50 add:cancel ratio replayed with
+  wrap-around, so the book stays bounded. The closest single-number "typical
+  op" figure.
+- **`add_cancel`** — tightest alloc/free loop: alternately add one order and
+  cancel it. Book holds 0 or 1 orders; a floor for the allocation/index path.
+- **`cancel_heavy`** — 50 orders pre-rested at one price; each iter appends at
+  the tail and cancels the head. The level never drains, so this isolates the
+  per-level FIFO unlink + slab reclaim (no BTreeSet churn).
+- **`match_single`** — 16 asks pre-rested at one price; each iter adds one at the
+  tail then crosses the head with a qty-1 bid (full consume). Add-before-consume
+  keeps the level from draining, isolating the aggressor's full-consume match
+  branch (freed-chain stitch, generation bump) plus one rest.
+- **`add_spread`** — a FIFO of 128 orders cycling through 256 distinct prices;
+  each iter adds at a fresh price (BTreeSet insert + new level) and cancels the
+  oldest (BTreeSet remove + level drain). Stresses the price index.
+- **`sweep`** — 512 single-order levels pre-rested; each iter's market order
+  drains the 8 lowest (full consume + level removal + BTreeSet remove +
+  best-price refresh, ×8). The book empties every 64 iters and the next iter
+  refills all strips (a burst amortised over 64 iters). *Its refill burst gives
+  it the widest confidence interval of the suite — quote it as approximate.*
 
-The drop from `L256xO1` (9.52 µs) to `L4xO64` (1.79 µs) — same total work,
-~5.3× wall-clock — is the headline payoff of the per-level matcher refactor
-(v0.0.2).
+#### `deep_book` — power-law depth profile
 
-### `cancel/mid_book`
+A large book with a realistic (Pareto-like) depth profile: per side,
+`orders(d) = max(1, round(1000 / d))` orders rest at each of 256 price levels
+`d` ticks off the mid — densest at the BBO, thinning outward. Liquidity is
+modelled as order *count* per level (the matcher-relevant dimension), so **~81%
+of a side's ~6.1 K orders sit in the near 80 levels**; the two-sided resting set
+is ~382 KiB, past L1. Both sides are populated with allocations interleaved, so
+a *shared* slab (v1) scatters same-side orders across mixed cache lines while a
+*per-side* slab (v2) packs them.
 
-Book pre-populated with 100 levels × 10 orders per level (= 1000 orders). The
-benchmark cancels an order whose id sits roughly in the middle of the
-population, exercising:
+Each hot iter is one market order that consumes exactly the near-mid band (~5 K
+orders — a long same-side chain walk), followed by rebuilding that band. This is
+the workload built to test v2's per-side-slab thesis at scale, and it's the one
+place the two variants clearly diverge: **v2 ≈ 52.8 µs vs v1 ≈ 56.0 µs (~6%)**,
+repeatable, versus the within-noise ties everywhere the working set fits in
+cache. (Numbers are the mean of three runs; v1 is stable to ~1%, v2 had one
+high outlier of three.)
 
-- `order_index.remove` (HashMap probe + delete)
-- `PriceLevel::remove` (intrusive list patch on `prev` / `next`)
-- `slab.free` (push slot onto the free list)
+### Scenario workloads (M6)
 
-No level drains because each price still holds 9 orders post-cancel — so the
-`best_price` recompute path is not hit. That's the steady-state cancel cost.
+Each replays an OU-mid + market-maker event stream (`scenarios.rs`), deterministic
+in a pinned `(params, seed)` and byte-stable via `rand_chacha`. All four are
+cross-checked for correctness: the same stream replayed against v1 and v2 must
+produce identical fills (`tests/parity.rs::scenario_parity`).
 
-### `mixed_workload/random_add_cancel`
-
-Steady-state book (~400 resting orders across 50 levels per side). Each
-iteration runs **1024 operations**, drawn from a fixed deterministic RNG seed:
-
-- 70% limit adds, sides 50/50, prices within ±50 ticks of mid
-- 30% cancels, targeting random previously-issued order ids (some will hit, some
-  will miss)
-
-The RNG sequence is built once during setup so the timed body contains no RNG
-overhead. This is the closest thing to a realistic throughput measurement here;
-the ~9.5 ns/op aggregate is a reasonable upper bound for what the engine can
-sustain at this book size.
+- **`calm_market`** — low-vol OU, MM-dominated, no jumps, ~1% aggressor rate.
+  The baseline cancel/replace regime.
+- **`news_event`** — calm baseline punctuated by rare fat-tailed (Student-t)
+  jumps that drag the mid, spreading quotes to far prices. Per-op cost ≈
+  `calm_market` — jumps are rare and the engine absorbs them cheaply (a finding,
+  not a defect).
+- **`illiquid`** — wide spread, thin book (mm_depth 4), frequent aggressors.
+  The most matching-heavy scenario, hence the highest per-event cost.
+- **`opening_auction`** — deep resting book (mm_depth 50). Stresses the slab and
+  index at higher occupancy.
 
 ## Notes on noise and methodology
 
-- **Setup is not timed.** `iter_batched(setup, body, BatchSize::SmallInput)`
-  runs `setup` outside the measured region.
-- **Slab capacity is 1 MiB slots** (`SLAB_CAP = 1 << 20`). That makes
-  `order_index` start out HashMap-pre-sized for 1M entries. Under the default
-  SipHash hasher this dominated `limit_rest` (every iter paid full hash setup
-  on a near-empty map); with the v0.0.5 `U64Mixer` it's no longer visible in
-  the numbers, but the pre-sizing still affects cache footprint — if you
-  benchmark pure insert throughput at production sizes, drop `SLAB_CAP`.
-- **`limit_sweep` ≈ `market_sweep`** at every level count: both paths delegate
-  to `match_against_opposite`, so the only difference is the per-iteration
-  limit-price check (~1 cycle, masked by hashmap latency).
-- **Short benches are noisy.** Anything under ~300 ns (e.g. `limit_match_single`,
-  `cancel`, `*sweep_*/4`) has confidence intervals 30–70 ns wide, so quote
-  these as approximate.
+- **Only the steady-state loop is timed.** Allocation, first-touch, population,
+  and warmup all happen before `iter_custom`'s measured region.
+- **Slab capacity** defaults per workload (16 K for populated workloads, 1 K for
+  the small ones) rather than 1 MiB, keeping first-touch cost and cache
+  footprint honest. Override with `BENCH_SLAB_CAP`.
+- **Allocator axis** (`BENCH_SLAB_ALLOC=system|madvise|hugetlb`) is wired but the
+  huge-page variants are Linux-only; on macOS they skip with a notice. The
+  cross-platform page-fault comparison is pending a Linux host.
+- **Run-to-run noise (observed over 3 runs).** The sub-15 ns micro-workloads
+  (`mixed`, `add_cancel`, `cancel_heavy`) drift ~1–5%; the ~20–35 ns workloads
+  (`match_single`, scenarios) ~2–7%; `sweep` is the outlier at ~3–13% because of
+  its every-64-iters refill burst. The table above averages three runs to damp
+  this. On a quiet, pinned machine the spreads would be tighter; treat any
+  v1/v2 gap smaller than the workload's spread as noise, not signal.
+- **`sweep` — quote loosely.** Its refill burst dominates variance; the 3-run
+  average (~389–396 ns) is a better estimate than any single median.

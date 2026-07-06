@@ -14,13 +14,24 @@
 //! Expected cost per fill ≈ Vec::push (~3 ns) + amortized batch slot store
 //! (~3 ns) ≈ 5–10 ns/fill — meaningfully cheaper than v2's per-fill
 //! publish (~15–20 ns) for any sweep ≥ 16 fills.
+//!
+//! Consumer axis (not yet in the generic framework): `BatchedDisruptorConsumer`
+//! isn't `Default`, so `OrderBook<BatchedDisruptorConsumer>` doesn't satisfy the
+//! `OrderBookApi` blanket impl (which requires `C: Default`) and can't ride the
+//! generic `benches/engine.rs` runner yet. Until the consumer axis lands, this
+//! stays a standalone bench driving the engine's inherent methods directly. It
+//! tracks engine-assigned `OrderHandle`s in a local `logical-id → handle` map,
+//! same pattern as `workloads::Harness` / the parity suite.
+
+use std::collections::HashMap;
+use std::hint::black_box;
 
 use calvera::{BusySpin, Producer, UniConsumerBarrier, UniProducer, build_uni_producer_unchecked};
-use calvera_books::orderbook::{
-    Fill, FillConsumer, MarketOrderMode, OrderBook, OrderId, Price, Side,
+use calvera_books::orderbooks::orderbook_legacy::{
+    Fill, FillConsumer, MarketOrderMode, OrderBook, OrderHandle, Price, Side,
 };
 use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -83,7 +94,9 @@ impl FillConsumer for BatchedDisruptorConsumer {
         let buf = &self.buffer;
         self.producer.batch_publish(n, |iter| {
             for (slot, fill) in iter.zip(buf.iter()) {
-                slot.resting_id = fill.resting_id.0;
+                // Engine-assigned handle → wire-friendly u64 (packed
+                // generation + slab index).
+                slot.resting_id = fill.resting_id.as_u64();
                 slot.quantity = fill.quantity;
             }
         });
@@ -101,20 +114,41 @@ fn fresh_book() -> Book {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Populate `levels` price levels per side, `orders_per_level` orders each,
+/// around a 10,000 mid. Resting orders don't cross, so nothing fills.
 fn populated_book(levels: u64, orders_per_level: u64) -> Book {
     let mut book = fresh_book();
-    let mut oid: u64 = 0;
     for i in 1..=levels {
         for _ in 0..orders_per_level {
-            oid += 1;
-            let _ = book.add_limit_order(OrderId(oid), Side::Bid, Price(10_000 - i), 1);
+            let _ = book.add_limit_order(Side::Bid, Price(10_000 - i), 1);
         }
         for _ in 0..orders_per_level {
-            oid += 1;
-            let _ = book.add_limit_order(OrderId(oid), Side::Ask, Price(10_000 + i), 1);
+            let _ = book.add_limit_order(Side::Ask, Price(10_000 + i), 1);
         }
     }
     book
+}
+
+/// Same as `populated_book`, but also returns the engine-assigned handles in
+/// insertion order. Handle at index `k` corresponds to logical order id
+/// `k + 1` (matching the old `OrderId(oid)` numbering), so cancels can target
+/// a specific resting order.
+fn populated_book_tracked(levels: u64, orders_per_level: u64) -> (Book, Vec<OrderHandle>) {
+    let mut book = fresh_book();
+    let mut handles = Vec::with_capacity((levels * orders_per_level * 2) as usize);
+    for i in 1..=levels {
+        for _ in 0..orders_per_level {
+            if let Ok(Some(h)) = book.add_limit_order(Side::Bid, Price(10_000 - i), 1) {
+                handles.push(h);
+            }
+        }
+        for _ in 0..orders_per_level {
+            if let Ok(Some(h)) = book.add_limit_order(Side::Ask, Price(10_000 + i), 1) {
+                handles.push(h);
+            }
+        }
+    }
+    (book, handles)
 }
 
 // ---------------------------------------------------------------------------
@@ -125,10 +159,9 @@ fn bench_limit_rest(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("single_level", |b| {
         b.iter_batched(
-            || (fresh_book(), 0u64),
-            |(mut book, mut oid)| {
-                oid += 1;
-                let _ = book.add_limit_order(black_box(OrderId(oid)), Side::Bid, Price(100), 1);
+            fresh_book,
+            |mut book| {
+                let _ = book.add_limit_order(Side::Bid, black_box(Price(100)), 1);
                 book
             },
             BatchSize::SmallInput,
@@ -137,10 +170,10 @@ fn bench_limit_rest(c: &mut Criterion) {
     g.bench_function("spread_levels", |b| {
         b.iter_batched(
             || (fresh_book(), 0u64),
-            |(mut book, mut oid)| {
-                oid += 1;
-                let p = 100 + (oid % 1000);
-                let _ = book.add_limit_order(black_box(OrderId(oid)), Side::Bid, Price(p), 1);
+            |(mut book, mut n)| {
+                n += 1;
+                let p = 100 + (n % 1000);
+                let _ = book.add_limit_order(Side::Bid, black_box(Price(p)), 1);
                 book
             },
             BatchSize::SmallInput,
@@ -159,11 +192,11 @@ fn bench_limit_match_single(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut book = fresh_book();
-                let _ = book.add_limit_order(OrderId(1), Side::Ask, Price(100), 1);
+                let _ = book.add_limit_order(Side::Ask, Price(100), 1);
                 book
             },
             |mut book| {
-                let res = book.add_limit_order(black_box(OrderId(2)), Side::Bid, Price(100), 1);
+                let res = book.add_limit_order(Side::Bid, black_box(Price(100)), 1);
                 (book, res)
             },
             BatchSize::SmallInput,
@@ -187,10 +220,9 @@ fn bench_limit_sweep_levels(c: &mut Criterion) {
                     || populated_book(levels, 1),
                     |mut book| {
                         let res = book.add_limit_order(
-                            black_box(OrderId(u64::MAX)),
                             Side::Bid,
                             Price(10_000 + levels),
-                            levels,
+                            black_box(levels),
                         );
                         (book, res)
                     },
@@ -217,9 +249,8 @@ fn bench_market_sweep(c: &mut Criterion) {
                     || populated_book(levels, 1),
                     |mut book| {
                         let res = book.add_market_order(
-                            black_box(OrderId(u64::MAX)),
                             Side::Bid,
-                            levels,
+                            black_box(levels),
                             MarketOrderMode::ImmediateOrCancel,
                         );
                         (book, res)
@@ -243,8 +274,10 @@ fn bench_cancel(c: &mut Criterion) {
             || {
                 let levels = 100u64;
                 let opl = 10u64;
-                let book = populated_book(levels, opl);
-                let target = OrderId(levels * opl);
+                let (book, handles) = populated_book_tracked(levels, opl);
+                // Old target was OrderId(levels * opl) = the 1000th order added
+                // (mid-book); handle index is that id minus one.
+                let target = handles[(levels * opl - 1) as usize];
                 (book, target)
             },
             |(mut book, target)| {
@@ -268,14 +301,20 @@ fn bench_mixed_workload(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
-                let book = populated_book(50, 4);
-                let mut ops: Vec<(bool, OrderId, Side, Price, u64)> =
+                let (book, populate_handles) = populated_book_tracked(50, 4);
+                // Logical id → handle. Populate orders are ids 1..=len; mixed
+                // adds continue from 100_000. Cancels that miss the map (never
+                // issued / already gone) no-op — same as the old OrderId path.
+                let handle_map: HashMap<u64, OrderHandle> =
+                    (1u64..).zip(populate_handles).collect();
+                // Precompute the op stream (logical ids, not handles).
+                let mut ops: Vec<(bool, u64, Side, Price, u64)> =
                     Vec::with_capacity(ops_per_iter as usize);
-                let mut next_oid: u64 = 100_000;
+                let mut next_id: u64 = 100_000;
                 for _ in 0..ops_per_iter {
                     let is_add = rng.random_bool(0.7);
                     if is_add {
-                        next_oid += 1;
+                        next_id += 1;
                         let side = if rng.random_bool(0.5) {
                             Side::Bid
                         } else {
@@ -286,20 +325,22 @@ fn bench_mixed_workload(c: &mut Criterion) {
                             Side::Bid => Price(10_000 - offset),
                             Side::Ask => Price(10_000 + offset),
                         };
-                        ops.push((true, OrderId(next_oid), side, price, 1));
+                        ops.push((true, next_id, side, price, 1));
                     } else {
-                        let target = OrderId(rng.random_range(1..=next_oid));
+                        let target = rng.random_range(1..=next_id);
                         ops.push((false, target, Side::Bid, Price(0), 0));
                     }
                 }
-                (book, ops)
+                (book, handle_map, ops)
             },
-            |(mut book, ops)| {
-                for (is_add, oid, side, price, qty) in ops {
+            |(mut book, mut handle_map, ops)| {
+                for (is_add, id, side, price, qty) in ops {
                     if is_add {
-                        let _ = black_box(book.add_limit_order(oid, side, price, qty));
-                    } else {
-                        let _ = black_box(book.cancel_limit_order(oid));
+                        if let Ok(Some(h)) = black_box(book.add_limit_order(side, price, qty)) {
+                            handle_map.insert(id, h);
+                        }
+                    } else if let Some(h) = handle_map.remove(&id) {
+                        let _ = black_box(book.cancel_limit_order(h));
                     }
                 }
                 book

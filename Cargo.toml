@@ -4,19 +4,24 @@ version = "0.0.6"
 edition = "2024"
 
 [dependencies]
+# Used only for the Linux mmap/madvise/MAP_HUGETLB slab paths. Cfg-gated; on
+# non-Linux platforms the crate is a no-op stub.
+libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.8.2"
 rand = { workspace = true }
+# Pinned-algorithm ChaCha RNG for the scenario layer — byte-stable event
+# streams across rand releases, compiler upgrades, and target archs (StdRng's
+# algorithm is not a stability guarantee). Already in the lockfile via `rand`.
+rand_chacha = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
 calvera = { git = "https://github.com/kaizu-xyz/calvera.git", branch = "main" }
 
 [[bench]]
-name = "orderbook"
+name = "engine"
 harness = false
-
-# [[bench]]
-# name = "orderbook_2"
-# harness = false
 
 [[bench]]
 name = "orderbook_disruptor_batched"
@@ -25,3 +30,7 @@ harness = false
 [[example]]
 name = "profile_matching"
 path = "profiling/profile_matching.rs"
+
+[[example]]
+name = "report"
+path = "examples/report.rs"
