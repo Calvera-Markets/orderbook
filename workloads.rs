@@ -22,6 +22,10 @@ use calvera_books::api::OrderBookApi;
 use calvera_books::errors::BookResult;
 use calvera_books::types::{MarketOrderMode, Price, Side, SlabAllocator};
 
+#[path = "scenarios.rs"]
+mod scenarios;
+use scenarios::{Event, Scenario};
+
 /// A single market-affecting action. `id`s are workload-local.
 #[derive(Debug, Clone, Copy)]
 pub enum Op {
@@ -504,119 +508,169 @@ pub fn sweep_workload<B: OrderBookApi>() -> Workload<SweepState<B>> {
 }
 
 // ---------------------------------------------------------------------------
-// `calm_market` — M6 scenario layer: OU-driven mid + simple market-maker
-// cancel/replace rhythm. Emits a pure `Vec<Op>` stream; the workload setup
-// precomputes it once and `hot` replays one op per call.
+// `deep_book` — large book with a realistic power-law (Pareto-like) depth
+// profile: liquidity is densest at the mid and thins with distance. Built to
+// stress the regime v2's per-side slab targets — deep same-side chains whose
+// working set exceeds L1, walked while the *shared* slab (v1) has them
+// interleaved with the opposite side.
 //
-// Cycle-clean: every add has a matching cancel within the stream (drain
-// step at the end), so when the runner wraps around the precomputed vec the
-// harness state is consistent — no slab leaks across long bench runs.
+// Shape: per side, `DEEP_LEVELS` price levels; level `d` (d ticks off mid)
+// holds `orders(d) = max(1, round(PEAK / d^ALPHA))` orders of qty 1. Liquidity
+// is modelled as order *count* per level (the matcher-relevant dimension —
+// what the FIFO walk traverses and the slab holds), so "80% of liquidity near
+// the price" means 80% of a side's resting orders sit in the near band. Both
+// sides are populated with bid/ask allocations interleaved, so a shared slab
+// lays same-side orders across mixed cache lines; a per-side slab packs them.
+//
+// Steady-state hot iter: one market order consumes exactly the near-mid band
+// (`DEEP_NEAR_LEVELS` levels — a long same-side chain walk), then the band is
+// rebuilt, restoring the book to its initial deep shape. The deep tail rests
+// permanently (footprint / TLB pressure); the opposite side rests as the
+// interleaving "pollution" a shared slab pays for. Deterministic, leak-free.
 // ---------------------------------------------------------------------------
 
-const CALM_MM_DEPTH: usize = 10;
-const CALM_AGGRESSOR_RATE: f64 = 0.01;
-const CALM_MID: f64 = 10_000.0;
-const CALM_THETA: f64 = 0.05; // OU mean-reversion rate per step
-const CALM_SIGMA: f64 = 0.5; // OU innovation std-dev (in ticks)
-const CALM_QUOTE_OFFSETS: u64 = 5; // each MM quote sits 1..=5 ticks away from mid
-const CALM_N_EVENTS: usize = 4096;
-const CALM_SEED: u64 = 0xCA1_DA7A;
+const DEEP_MID: u64 = 1_000_000;
+const DEEP_LEVELS: u64 = 256; // price levels per side
+const DEEP_NEAR_LEVELS: u64 = 80; // churned near-mid band (holds ~80% of orders)
+const DEEP_PEAK: f64 = 1000.0; // orders at the innermost level
+const DEEP_ALPHA: f64 = 1.0; // power-law decay exponent
 
-/// Standard-normal sample via Box-Muller. Two uniforms in → one normal out.
-/// Discards the second-half pair to keep state minimal; for a scenario-scale
-/// generator the throughput tradeoff is irrelevant.
-fn box_muller(rng: &mut StdRng) -> f64 {
-    // Guard against u1 == 0 producing ln(0) = -inf.
-    let mut u1: f64 = rng.random_range(0.0..1.0);
-    if u1 == 0.0 {
-        u1 = f64::MIN_POSITIVE;
-    }
-    let u2: f64 = rng.random_range(0.0..1.0);
-    let r = (-2.0 * u1.ln()).sqrt();
-    let theta = 2.0 * std::f64::consts::PI * u2;
-    r * theta.cos()
+/// Orders resting at level `d` (d ticks off mid): a floored power law.
+#[inline]
+fn deep_orders_at(d: u64) -> u64 {
+    let raw = DEEP_PEAK / (d as f64).powf(DEEP_ALPHA);
+    (raw.round() as u64).max(1)
 }
 
-/// Generate an OU + market-maker event stream. Calm-market regime: low
-/// volatility, no jumps, ~1% market-order rate. Cycle-clean (drains to zero
-/// live quotes at the end).
-fn calm_market_events(seed: u64, n_events: usize) -> Vec<Op> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut events = Vec::with_capacity(n_events);
-
-    let mut next_id: u64 = 100_000;
-    let mut live: VecDeque<u64> = VecDeque::with_capacity(CALM_MM_DEPTH + 1);
-    let mut mid: f64 = CALM_MID;
-
-    // Reserve the last `CALM_MM_DEPTH` events for the drain so the stream is
-    // self-balancing (every add has a cancel).
-    let main_n = n_events.saturating_sub(CALM_MM_DEPTH);
-
-    while events.len() < main_n {
-        // OU step. dX = θ(μ − X) dt + σ ε, where ε is standard normal.
-        // Discretised with dt = 1 implicit.
-        let z = box_muller(&mut rng);
-        mid += CALM_THETA * (CALM_MID - mid) + CALM_SIGMA * z;
-        let tick = mid.round() as u64;
-
-        // 1% chance: aggressor market order. Doesn't touch the MM deque.
-        if rng.random_bool(CALM_AGGRESSOR_RATE) {
-            let side = if rng.random_bool(0.5) { Side::Bid } else { Side::Ask };
-            events.push(Op::Market { side, qty: 1, mode: MarketOrderMode::ImmediateOrCancel });
-            continue;
-        }
-
-        // MM rhythm: keep deque around CALM_MM_DEPTH.
-        // If full, cancel oldest before adding the new quote.
-        if live.len() >= CALM_MM_DEPTH {
-            if let Some(id) = live.pop_front() {
-                events.push(Op::Cancel { id });
-                if events.len() >= main_n {
-                    break;
-                }
-            }
-        }
-
-        next_id += 1;
-        let side = if rng.random_bool(0.5) { Side::Bid } else { Side::Ask };
-        let offset = rng.random_range(1..=CALM_QUOTE_OFFSETS);
-        let price = match side {
-            Side::Bid => tick.saturating_sub(offset),
-            Side::Ask => tick.saturating_add(offset),
-        };
-        events.push(Op::Limit { id: next_id, side, price: Price(price), qty: 1 });
-        live.push_back(next_id);
-    }
-
-    // Drain phase: cancel every remaining live quote so the stream ends with
-    // an empty harness (cycle-clean).
-    while let Some(id) = live.pop_front() {
-        if events.len() >= n_events {
-            break;
-        }
-        events.push(Op::Cancel { id });
-    }
-
-    events
+/// Total orders in the near-mid band (one side) — also the market-order qty
+/// that consumes exactly that band.
+fn deep_near_band_qty() -> u64 {
+    (1..=DEEP_NEAR_LEVELS).map(deep_orders_at).sum()
 }
 
-pub struct CalmMarketState<B: OrderBookApi> {
+/// Populate both sides with the power-law depth profile, interleaving bid/ask
+/// allocations so a shared slab mixes sides across adjacent slots.
+fn populate_deep_book<B: OrderBookApi>(book: &mut B) {
+    for d in 1..=DEEP_LEVELS {
+        for _ in 0..deep_orders_at(d) {
+            let _ = book.add_limit(Side::Bid, Price(DEEP_MID - d), 1);
+            let _ = book.add_limit(Side::Ask, Price(DEEP_MID + d), 1);
+        }
+    }
+}
+
+pub struct DeepBookState<B: OrderBookApi> {
+    pub book: B,
+    /// Cached qty that consumes exactly the near-mid ask band.
+    pub near_qty: u64,
+}
+
+pub fn setup_deep_book<B: OrderBookApi>(
+    slab_cap: usize,
+    alloc: SlabAllocator,
+) -> BookResult<DeepBookState<B>> {
+    let mut book = B::new_with_alloc(slab_cap, alloc)?;
+    populate_deep_book(&mut book);
+    Ok(DeepBookState {
+        book,
+        near_qty: deep_near_band_qty(),
+    })
+}
+
+#[inline]
+pub fn hot_deep_book<B: OrderBookApi>(s: &mut DeepBookState<B>) {
+    // Sweep the near-mid band: a market bid whose qty equals the band's order
+    // count consumes exactly levels 1..=DEEP_NEAR_LEVELS (best-first), walking
+    // a long same-side ask chain.
+    let _ = s
+        .book
+        .add_market(Side::Bid, s.near_qty, MarketOrderMode::ImmediateOrCancel);
+    // Rebuild the band, restoring the deep shape (the tail below rests).
+    for d in 1..=DEEP_NEAR_LEVELS {
+        for _ in 0..deep_orders_at(d) {
+            let _ = s.book.add_limit(Side::Ask, Price(DEEP_MID + d), 1);
+        }
+    }
+}
+
+pub fn deep_book_workload<B: OrderBookApi>() -> Workload<DeepBookState<B>> {
+    Workload {
+        name: "deep_book",
+        // Holds the full two-sided deep book (~12 K orders) with headroom for
+        // the near-band rebuild transient.
+        slab_cap: 1 << 15,
+        // Each iter is heavy (sweep + rebuild ~10 K ops), so a few warm passes
+        // suffice to prefault and reach steady state.
+        warmup_iters: 20,
+        setup: setup_deep_book::<B>,
+        hot: hot_deep_book::<B>,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario-backed workloads (M6). Each wraps a named scenario from
+// `scenarios.rs` (OU-driven mid + Student-t jumps + market-maker cancel/replace
+// rhythm). The scenario emits a pure `Vec<Event>`; setup converts it to `Op`
+// once and `hot` replays one op per call, wrapping around the precomputed vec.
+//
+// Scenarios are cycle-clean (their tail drains every live quote), so wrapping
+// re-enters a consistent state — no slab leak across long bench runs. Ids are
+// reused each cycle, so the harness `id → handle` map stays bounded.
+// ---------------------------------------------------------------------------
+
+/// Events per scenario stream. One wrap of this is the bench's replay cycle.
+const SCENARIO_N_EVENTS: usize = 4096;
+
+/// Translate a scenario `Event` into the harness's internal `Op`.
+#[inline]
+fn event_to_op(e: Event) -> Op {
+    match e {
+        Event::LimitAdd {
+            id,
+            side,
+            price,
+            qty,
+        } => Op::Limit {
+            id,
+            side,
+            price: Price(price),
+            qty,
+        },
+        Event::Cancel { id } => Op::Cancel { id },
+        Event::Market { side, qty, mode } => Op::Market { side, qty, mode },
+    }
+}
+
+/// Per-iter state shared by every scenario workload: a warm harness plus the
+/// precomputed op stream and a wrap-around cursor.
+pub struct ScenarioState<B: OrderBookApi> {
     pub harness: Harness<B>,
     pub ops: Vec<Op>,
     pub idx: usize,
 }
 
-pub fn setup_calm_market<B: OrderBookApi>(
+/// Build scenario state: precompute the event stream (untimed) and convert to
+/// ops. Generic over the scenario so each named workload is a one-line setup.
+fn setup_scenario<B: OrderBookApi>(
+    scenario: &dyn Scenario,
     slab_cap: usize,
     alloc: SlabAllocator,
-) -> BookResult<CalmMarketState<B>> {
+) -> BookResult<ScenarioState<B>> {
     let harness = Harness::<B>::new_with_alloc(slab_cap, alloc)?;
-    let ops = calm_market_events(CALM_SEED, CALM_N_EVENTS);
-    Ok(CalmMarketState { harness, ops, idx: 0 })
+    let ops = scenario
+        .generate(SCENARIO_N_EVENTS)
+        .into_iter()
+        .map(event_to_op)
+        .collect();
+    Ok(ScenarioState {
+        harness,
+        ops,
+        idx: 0,
+    })
 }
 
 #[inline]
-pub fn hot_calm_market<B: OrderBookApi>(state: &mut CalmMarketState<B>) {
+pub fn hot_scenario<B: OrderBookApi>(state: &mut ScenarioState<B>) {
     let op = &state.ops[state.idx];
     state.harness.apply(op);
     state.idx = state.idx.wrapping_add(1);
@@ -625,17 +679,56 @@ pub fn hot_calm_market<B: OrderBookApi>(state: &mut CalmMarketState<B>) {
     }
 }
 
-pub fn calm_market_workload<B: OrderBookApi>() -> Workload<CalmMarketState<B>> {
-    Workload {
-        name: "calm_market",
-        slab_cap: 1 << 14,
-        // One full pass of the precomputed stream as warmup. Drains the
-        // stream once cleanly so the timed body starts in steady-state.
-        warmup_iters: CALM_N_EVENTS,
-        setup: setup_calm_market::<B>,
-        hot: hot_calm_market::<B>,
-    }
+/// Emit the workload constructor + its (capture-free) setup fn for a named
+/// scenario. `Workload::setup` is a bare `fn` pointer, so each scenario needs
+/// its own monomorphic setup that names its generator.
+macro_rules! scenario_workload {
+    ($ctor:ident, $setup:ident, $scenario:path, $name:literal) => {
+        fn $setup<B: OrderBookApi>(
+            slab_cap: usize,
+            alloc: SlabAllocator,
+        ) -> BookResult<ScenarioState<B>> {
+            setup_scenario::<B>(&$scenario(), slab_cap, alloc)
+        }
+
+        pub fn $ctor<B: OrderBookApi>() -> Workload<ScenarioState<B>> {
+            Workload {
+                name: $name,
+                slab_cap: 1 << 14,
+                // One full pass of the stream as warmup, so the timed body
+                // starts in steady state (and the stream drains once cleanly).
+                warmup_iters: SCENARIO_N_EVENTS,
+                setup: $setup::<B>,
+                hot: hot_scenario::<B>,
+            }
+        }
+    };
 }
+
+scenario_workload!(
+    calm_market_workload,
+    setup_calm_market,
+    scenarios::calm_market,
+    "calm_market"
+);
+scenario_workload!(
+    news_event_workload,
+    setup_news_event,
+    scenarios::news_event,
+    "news_event"
+);
+scenario_workload!(
+    illiquid_workload,
+    setup_illiquid,
+    scenarios::illiquid,
+    "illiquid"
+);
+scenario_workload!(
+    opening_auction_workload,
+    setup_opening_auction,
+    scenarios::opening_auction,
+    "opening_auction"
+);
 
 /// Constructor for the mixed workload, parameterised over the variant.
 pub fn mixed_workload<B: OrderBookApi>() -> Workload<MixedState<B>> {
@@ -728,6 +821,59 @@ mod tests {
             let _ = run_warm(&sweep_workload::<OB1<Vc1>>(), iters);
             let _ = run_warm(&sweep_workload::<OB2<Vc2>>(), iters);
         }
+    }
+
+    #[test]
+    fn deep_book_is_concentrated_and_survives() {
+        // Liquidity concentration: the near band should hold the bulk of a
+        // side's orders (the "~80% near the price" shape).
+        let total: u64 = (1..=DEEP_LEVELS).map(deep_orders_at).sum();
+        let near = deep_near_band_qty();
+        let pct = near as f64 / total as f64 * 100.0;
+        eprintln!(
+            "deep_book: {} orders/side across {} levels; near band ({} levels) = {} orders ({:.0}%); \
+             two-sided footprint ~{} KiB",
+            total,
+            DEEP_LEVELS,
+            DEEP_NEAR_LEVELS,
+            near,
+            pct,
+            (total * 2 * 32) / 1024,
+        );
+        assert!(
+            pct >= 75.0,
+            "near band should hold ~80% of a side's liquidity, got {pct:.0}%"
+        );
+        // Survival on both variants (each iter is heavy; 200 iters is plenty
+        // to prove steady state — a leak or SlabFull would panic).
+        let _ = run_warm(&deep_book_workload::<OB1<Vc1>>(), 200);
+        let _ = run_warm(&deep_book_workload::<OB2<Vc2>>(), 200);
+    }
+
+    #[test]
+    fn scenarios_are_deterministic() {
+        // A fixed (params, seed) must yield a byte-identical stream every call
+        // — the property that lets a scenario be shared across hosts/runs.
+        for s in scenarios::all() {
+            let a = s.generate(2048);
+            let b = s.generate(2048);
+            assert_eq!(a.len(), b.len(), "scenario {} length drift", s.name());
+            assert!(a == b, "scenario {} is not deterministic", s.name());
+        }
+    }
+
+    #[test]
+    fn scenario_workloads_run_both_variants() {
+        // Each scenario replayed 50k iters (>> stream length, so it wraps many
+        // times) on both variants. A leak or bad steady state would SlabFull.
+        let _ = run_warm(&calm_market_workload::<OB1<Vc1>>(), 50_000);
+        let _ = run_warm(&calm_market_workload::<OB2<Vc2>>(), 50_000);
+        let _ = run_warm(&news_event_workload::<OB1<Vc1>>(), 50_000);
+        let _ = run_warm(&news_event_workload::<OB2<Vc2>>(), 50_000);
+        let _ = run_warm(&illiquid_workload::<OB1<Vc1>>(), 50_000);
+        let _ = run_warm(&illiquid_workload::<OB2<Vc2>>(), 50_000);
+        let _ = run_warm(&opening_auction_workload::<OB1<Vc1>>(), 50_000);
+        let _ = run_warm(&opening_auction_workload::<OB2<Vc2>>(), 50_000);
     }
 
     #[test]

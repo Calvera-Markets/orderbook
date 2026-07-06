@@ -1,5 +1,48 @@
 # calvera-books — Changelog
 
+## Unreleased — parameterized benchmark framework
+
+**Change.** Replaced the copy-paste-per-variant bench harness with a runner
+parameterized over the `OrderBook` implementation, and added warm, steady-state
+workloads that measure engine cost rather than cold-start/first-touch noise.
+This is tooling + additive public API; the engine hot path is unchanged (the
+one engine-visible addition is the slab allocator axis).
+
+- **`OrderBookApi` trait** (`src/api.rs`): variant-agnostic surface with an
+  associated `Handle` type. Both engines implement it via thin delegation, so
+  benches/workloads/parity are generic over the implementation. Verified free:
+  the release binary has zero wrapper symbols and timing parity vs direct calls.
+- **Shared `workloads.rs`** (outside `src/` — bench/test infra, pulled in via
+  `#[path]`): single source of truth for op streams, with a generic `Harness`
+  mapping logical ids → engine handles. Warm micro-workloads: `mixed`,
+  `add_cancel`, `add_spread`, `cancel_heavy`, `match_single` (full-consume
+  match), `sweep` (multi-level market sweep via multi-strip refill), and
+  `deep_book` (large power-law/Pareto depth book, ~80% of liquidity near the
+  mid; sweeps + rebuilds the near band — the workload that exercises v2's
+  per-side-slab packing at a working set past L1, where v2 runs ~6% faster).
+- **Generic runner** (`benches/engine.rs`): one bench target, all
+  (impl × workload) pairs via `iter_custom` (setup + warmup untimed). Deletes
+  the legacy per-variant bench files; migrates `orderbook_disruptor_batched` to
+  the current handle API. Ids encode `impl/workload[/cap_N][/alloc_slug]`.
+- **Slab allocator axis**: `SlabAllocator { System, MadvHugepage, Hugetlb }` +
+  `OrderBookApi::new_with_alloc` + `BookError::UnsupportedAllocator`. Linux
+  `mmap`/`madvise(MADV_HUGEPAGE)`/`MAP_HUGETLB` paths are cfg-gated with a
+  `munmap` `Drop`; non-Linux returns `UnsupportedAllocator`. `MarketOrderMode`
+  moved to `src/types.rs` alongside `SlabAllocator`. `libc` is now a direct dep.
+- **Reporting** (`examples/report.rs`): flattens criterion `estimates.json` into
+  one host-tagged JSON + CSV under `benches/logs/` (`just report`).
+- **Scenario layer** (M6, `scenarios.rs`): `Event`/`Scenario` abstraction with
+  an OU price path + Student-t jumps (`rand_chacha` for byte-stability) driving
+  a market-maker cancel/replace model. Four named scenarios — `calm_market`,
+  `news_event`, `illiquid`, `opening_auction` — wired as workloads. (Serde
+  derive + recorded-tape format deferred.)
+- **Unified parity suite**: `parity.rs` + `parity_2.rs` (byte-identical bar the
+  import) collapsed into one generic suite in `tests/common` that runs the same
+  28 scenarios against both variants (56 tests). Adds a cross-variant check that
+  the same scenario Event stream yields identical fills on v1 and v2.
+
+---
+
 ## v0.0.6 — `OrderId` → engine-assigned generational `OrderHandle`
 
 **Change.** Deleted the `OrderId` type. Callers no longer pick the

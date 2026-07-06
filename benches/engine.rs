@@ -16,7 +16,8 @@ use calvera_books::types::SlabAllocator;
 
 use workloads::{
     Workload, add_cancel_workload, add_spread_workload, calm_market_workload,
-    cancel_heavy_workload, match_single_workload, mixed_workload, sweep_workload,
+    cancel_heavy_workload, deep_book_workload, illiquid_workload, match_single_workload,
+    mixed_workload, news_event_workload, opening_auction_workload, sweep_workload,
 };
 
 /// Parse `BENCH_SLAB_CAP` value: accepts plain integers (`16384`) or
@@ -100,9 +101,17 @@ fn run(c: &mut Criterion) {
     bench_workload(c, "v2", match_single_workload::<OB2<Vc2>>());
     bench_workload(c, "v1", sweep_workload::<OB1<Vc1>>());
     bench_workload(c, "v2", sweep_workload::<OB2<Vc2>>());
+    bench_workload(c, "v1", deep_book_workload::<OB1<Vc1>>());
+    bench_workload(c, "v2", deep_book_workload::<OB2<Vc2>>());
     // M6 scenario layer.
     bench_workload(c, "v1", calm_market_workload::<OB1<Vc1>>());
     bench_workload(c, "v2", calm_market_workload::<OB2<Vc2>>());
+    bench_workload(c, "v1", news_event_workload::<OB1<Vc1>>());
+    bench_workload(c, "v2", news_event_workload::<OB2<Vc2>>());
+    bench_workload(c, "v1", illiquid_workload::<OB1<Vc1>>());
+    bench_workload(c, "v2", illiquid_workload::<OB2<Vc2>>());
+    bench_workload(c, "v1", opening_auction_workload::<OB1<Vc1>>());
+    bench_workload(c, "v2", opening_auction_workload::<OB2<Vc2>>());
 }
 
 criterion_group!(engine, run);

@@ -28,6 +28,10 @@ use calvera_books::types::{MarketOrderMode, MarketOrderResult, Price, Side};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+#[path = "../../scenarios.rs"]
+pub mod scenarios;
+use scenarios::Event;
+
 // ---------------------------------------------------------------------------
 // Fill inspection — the one capability not on `OrderBookApi`.
 // ---------------------------------------------------------------------------
@@ -216,6 +220,45 @@ where
             })
             .collect()
     }
+}
+
+/// Translate a scenario `Event` into the parity harness's `Op`. Market orders
+/// carry their mode, which maps to the two parity market variants.
+fn event_to_op(e: Event) -> Op {
+    match e {
+        Event::LimitAdd {
+            id,
+            side,
+            price,
+            qty,
+        } => Op::Limit {
+            id,
+            side,
+            price,
+            qty,
+        },
+        Event::Cancel { id } => Op::Cancel { id },
+        Event::Market { side, qty, mode } => match mode {
+            MarketOrderMode::ImmediateOrCancel => Op::MarketIoc { side, qty },
+            MarketOrderMode::FillOrKill => Op::MarketFok { side, qty },
+        },
+    }
+}
+
+/// Replay a scenario `Event` stream against a fresh book and return every fill,
+/// translated to logical ids. Used by the cross-variant parity check: the same
+/// stream must produce byte-identical fills on every `OrderBookApi` impl.
+pub fn run_scenario_fills<B: ParityBook>(events: &[Event]) -> Vec<FillN>
+where
+    B::Handle: Eq + Hash,
+{
+    // Slab sized well above any scenario's peak live set (bounded by mm_depth
+    // plus transient); freed slots recycle, so this never exhausts.
+    let mut p = Harness::<B>::new(1 << 16);
+    for &e in events {
+        p.apply(event_to_op(e));
+    }
+    p.fills()
 }
 
 /// Returns the slice of fills produced *during* `f`, translated to logical

@@ -17,7 +17,11 @@
 //!   cancel_heavy  — head-cancel + tail-add on a 50-deep single-level queue
 //!   match_single  — full-consume match at one level (add tail + cross head)
 //!   sweep         — market order draining 8 levels/iter (multi-strip refill)
-//!   calm_market   — M6 scenario: OU-driven mid + market-maker cancel/replace
+//!   deep_book     — power-law depth book; sweep + rebuild the near-mid band
+//!   calm_market      — M6 scenario: low-vol OU, MM cancel/replace, no jumps
+//!   news_event       — M6 scenario: Student-t jumps → far-level activity
+//!   illiquid         — M6 scenario: wide spread, thin book, frequent aggressors
+//!   opening_auction  — M6 scenario: deep resting book, slab/index growth
 //!
 //! Variants:
 //!   v1 — orderbook
@@ -35,7 +39,8 @@ use calvera_books::types::SlabAllocator;
 
 use workloads::{
     Workload, add_cancel_workload, add_spread_workload, calm_market_workload,
-    cancel_heavy_workload, match_single_workload, mixed_workload, sweep_workload,
+    cancel_heavy_workload, deep_book_workload, illiquid_workload, match_single_workload,
+    mixed_workload, news_event_workload, opening_auction_workload, sweep_workload,
 };
 
 /// Only check the deadline every 4096 iters. Without this, `Instant::now()`
@@ -48,8 +53,9 @@ fn usage() -> ! {
     eprintln!("usage: profile_matching <workload> <variant> [seconds]");
     eprintln!();
     eprintln!(
-        "  workloads: mixed | add_cancel | add_spread | cancel_heavy | match_single | sweep | calm_market"
+        "  workloads: mixed | add_cancel | add_spread | cancel_heavy | match_single | sweep | deep_book"
     );
+    eprintln!("             | calm_market | news_event | illiquid | opening_auction");
     eprintln!("  variants:  v1 | v2");
     eprintln!("  seconds:   default 20");
     std::process::exit(1);
@@ -109,8 +115,20 @@ fn main() {
         ("match_single", "v2") => run(&variant, match_single_workload::<OB2<Vc2>>(), deadline),
         ("sweep", "v1") => run(&variant, sweep_workload::<OB1<Vc1>>(), deadline),
         ("sweep", "v2") => run(&variant, sweep_workload::<OB2<Vc2>>(), deadline),
+        ("deep_book", "v1") => run(&variant, deep_book_workload::<OB1<Vc1>>(), deadline),
+        ("deep_book", "v2") => run(&variant, deep_book_workload::<OB2<Vc2>>(), deadline),
         ("calm_market", "v1") => run(&variant, calm_market_workload::<OB1<Vc1>>(), deadline),
         ("calm_market", "v2") => run(&variant, calm_market_workload::<OB2<Vc2>>(), deadline),
+        ("news_event", "v1") => run(&variant, news_event_workload::<OB1<Vc1>>(), deadline),
+        ("news_event", "v2") => run(&variant, news_event_workload::<OB2<Vc2>>(), deadline),
+        ("illiquid", "v1") => run(&variant, illiquid_workload::<OB1<Vc1>>(), deadline),
+        ("illiquid", "v2") => run(&variant, illiquid_workload::<OB2<Vc2>>(), deadline),
+        ("opening_auction", "v1") => {
+            run(&variant, opening_auction_workload::<OB1<Vc1>>(), deadline)
+        }
+        ("opening_auction", "v2") => {
+            run(&variant, opening_auction_workload::<OB2<Vc2>>(), deadline)
+        }
         _ => usage(),
     }
 }
