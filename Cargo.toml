@@ -4,19 +4,20 @@ version = "0.0.6"
 edition = "2024"
 
 [dependencies]
+# Used only for the Linux mmap/madvise/MAP_HUGETLB slab paths. Cfg-gated; on
+# non-Linux platforms the crate is a no-op stub.
+libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.8.2"
 rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 calvera = { git = "https://github.com/kaizu-xyz/calvera.git", branch = "main" }
 
 [[bench]]
-name = "orderbook"
+name = "engine"
 harness = false
-
-# [[bench]]
-# name = "orderbook_2"
-# harness = false
 
 [[bench]]
 name = "orderbook_disruptor_batched"
@@ -25,3 +26,7 @@ harness = false
 [[example]]
 name = "profile_matching"
 path = "profiling/profile_matching.rs"
+
+[[example]]
+name = "report"
+path = "examples/report.rs"

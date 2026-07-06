@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Capture one flamegraph per matching-engine logic pathway.
+# Capture one flamegraph per (workload × variant) combo.
 #
-# Builds the `profile_matching` example, runs each mode for `DUR_RUN`
+# Builds the `profile_matching` example, runs each combo for `DUR_RUN`
 # seconds, samples it for `DUR_SAMPLE` seconds with macOS `sample`, and writes
 # results into per-run subdirectories so each invocation is self-contained.
 #
@@ -9,15 +9,16 @@
 # subfolder under both flamegraph/ and logs/. Output layout:
 #
 #   crates/calvera-books/profiling/
-#     flamegraph/<RUN_ID>/flamegraph-<mode>.svg   ← what you open in a browser
-#     logs/<RUN_ID>/<mode>.log                     ← throughput / stdout
-#     logs/<RUN_ID>/<mode>.sample.txt              ← Apple `sample` raw output
+#     flamegraph/<RUN_ID>/flamegraph-<variant>-<workload>.svg
+#     logs/<RUN_ID>/<variant>-<workload>.log              ← throughput / stdout
+#     logs/<RUN_ID>/<variant>-<workload>.sample.txt       ← Apple `sample` raw
 #
-# Modes map 1:1 to criterion benches (see BENCHMARKS.md).
+# Combos map 1:1 to bench IDs in benches/engine.rs. Extend together with M3.3
+# as new workloads are added.
 #
 # Env knobs:
-#   DUR_RUN     wall-clock budget per mode (default 12s)
-#   DUR_SAMPLE  how long `sample` captures per mode (default 8s)
+#   DUR_RUN     wall-clock budget per combo (default 12s)
+#   DUR_SAMPLE  how long `sample` captures per combo (default 8s)
 #
 # Requirements (install once):
 #   cargo install inferno          # inferno-collapse-sample, inferno-flamegraph
@@ -39,13 +40,14 @@ mkdir -p "$FLAMEGRAPH_RUN_DIR" "$LOG_RUN_DIR"
 DUR_RUN=${DUR_RUN:-12}
 DUR_SAMPLE=${DUR_SAMPLE:-8}
 
-MODES=(
-  "rest-single"
-  "rest-spread"
-  "match-single"
-  "sweep-limit"
-  "sweep-market"
-  "cancel"
+# (workload, variant) combos, one per line as "workload:variant".
+COMBOS=(
+  "mixed:v1"
+  "mixed:v2"
+  "add_cancel:v1"
+  "add_cancel:v2"
+  "calm_market:v1"
+  "calm_market:v2"
 )
 
 echo "→ building profile_matching (release)..."
@@ -54,28 +56,31 @@ BIN="$ROOT/target/release/examples/profile_matching"
 
 echo ""
 echo "→ run-id: $RUN_ID"
-echo "→ profiling ${#MODES[@]} modes (${DUR_RUN}s each, ${DUR_SAMPLE}s sampled)..."
+echo "→ profiling ${#COMBOS[@]} combos (${DUR_RUN}s each, ${DUR_SAMPLE}s sampled)..."
 SUMMARY=()
 
-for MODE in "${MODES[@]}"; do
+for COMBO in "${COMBOS[@]}"; do
+  WORKLOAD="${COMBO%%:*}"
+  VARIANT="${COMBO##*:}"
+  TAG="${VARIANT}-${WORKLOAD}"
   echo ""
-  echo "  [$MODE]"
+  echo "  [$TAG]"
 
-  SAMPLE_TXT="$LOG_RUN_DIR/${MODE}.sample.txt"
-  STDOUT_LOG="$LOG_RUN_DIR/${MODE}.log"
-  SVG="$FLAMEGRAPH_RUN_DIR/flamegraph-${MODE}.svg"
+  SAMPLE_TXT="$LOG_RUN_DIR/${TAG}.sample.txt"
+  STDOUT_LOG="$LOG_RUN_DIR/${TAG}.log"
+  SVG="$FLAMEGRAPH_RUN_DIR/flamegraph-${TAG}.svg"
 
-  "$BIN" "$MODE" "$DUR_RUN" > "$STDOUT_LOG" 2>&1 &
+  "$BIN" "$WORKLOAD" "$VARIANT" "$DUR_RUN" > "$STDOUT_LOG" 2>&1 &
   PID=$!
   sample "$PID" "$DUR_SAMPLE" -file "$SAMPLE_TXT" > /dev/null 2>&1
   wait "$PID"
 
   inferno-collapse-sample "$SAMPLE_TXT" \
     | inferno-flamegraph \
-        --title "calvera-books: $MODE — run $RUN_ID (${DUR_RUN}s run, ${DUR_SAMPLE}s sampled)" \
+        --title "calvera-books: $TAG — run $RUN_ID (${DUR_RUN}s run, ${DUR_SAMPLE}s sampled)" \
     > "$SVG"
 
-  SUMMARY_LINE=$(grep -E "^${MODE}" "$STDOUT_LOG" || cat "$STDOUT_LOG")
+  SUMMARY_LINE=$(grep -E "^${VARIANT}/" "$STDOUT_LOG" || cat "$STDOUT_LOG")
   echo "  → $SVG"
   echo "  $SUMMARY_LINE"
   SUMMARY+=("$SUMMARY_LINE")
@@ -86,8 +91,10 @@ echo "================================================================"
 echo "done. run-id: $RUN_ID"
 echo ""
 echo "flamegraphs:"
-for MODE in "${MODES[@]}"; do
-  echo "  $FLAMEGRAPH_RUN_DIR/flamegraph-${MODE}.svg"
+for COMBO in "${COMBOS[@]}"; do
+  WORKLOAD="${COMBO%%:*}"
+  VARIANT="${COMBO##*:}"
+  echo "  $FLAMEGRAPH_RUN_DIR/flamegraph-${VARIANT}-${WORKLOAD}.svg"
 done
 echo ""
 echo "logs:"

@@ -18,6 +18,11 @@ pub enum BookError {
     EmptyLevel,
     /// `best_price` pointed at a price with no matching entry in `levels` — invariant violation.
     MissingLevel,
+    /// `new_with_alloc` was called with a `SlabAllocator` variant unsupported
+    /// on this platform (Linux variants on non-Linux), or the underlying
+    /// allocation syscall failed (e.g., `mmap(MAP_HUGETLB)` against an empty
+    /// hugepage pool).
+    UnsupportedAllocator,
 }
 
 pub type BookResult<T> = core::result::Result<T, BookError>;

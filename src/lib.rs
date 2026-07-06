@@ -1,3 +1,4 @@
+pub mod api;
 pub mod errors;
 pub mod orderbook;
 pub mod orderbook_2;

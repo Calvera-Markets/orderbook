@@ -1,9 +1,10 @@
-//! Shared value types used across all `OrderBook` variants.
+//! Genuinely encoding-agnostic value types shared across all `OrderBook`
+//! variants. No design opinion lives here.
 //!
-//! These are byte-identical across implementations and carry no behavior tied
-//! to a particular matcher, so they live here rather than being duplicated per
-//! variant module. `OrderHandle` / `SlabIndex` / `Fill` will join them once the
-//! handle encoding is unified (M1.2).
+//! Deliberately excluded: `OrderHandle` (its bit layout is variant-specific —
+//! v1 has no side bit, v2 packs the side), `SlabIndex`, and `Fill`. Those stay
+//! in each variant module; the framework abstracts the handle through the
+//! `OrderBookApi::Handle` associated type rather than a shared concrete type.
 
 /// Fixed-point price. 1 unit = 1 tick of the instrument.
 /// All price arithmetic is integer arithmetic.
@@ -15,6 +16,65 @@ pub struct Price(pub u64);
 pub enum Side {
     Bid = 0,
     Ask = 1,
+}
+
+/// Backing allocator for the engine's slab.
+///
+/// The slab is the dominant single allocation in the engine (~32 B × capacity).
+/// On Linux, page-fault count for fresh slabs is proportional to capacity
+/// divided by page size — 4× more faults on 4 KB pages than 16 KB. Routing
+/// the slab buffer through huge-page-friendly allocators (madvise/hugetlb)
+/// cuts that to ~zero. See `lessons/pages.md`.
+///
+/// Non-default variants are Linux-only; constructing an `OrderBook` with
+/// them on other platforms returns `BookError::UnsupportedAllocator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlabAllocator {
+    /// Default. Slab backed by `Vec<Order>` via the system allocator.
+    /// Cross-platform; the only choice that works on macOS.
+    System,
+    /// Linux: `mmap` + `madvise(MADV_HUGEPAGE)` — kernel *prefers* (but
+    /// doesn't guarantee) 2 MB pages for the slab. Reduces TLB pressure
+    /// and page-fault count without needing a pre-reserved hugepage pool.
+    MadvHugepage,
+    /// Linux: `mmap(MAP_HUGETLB)` — forces 2 MB pages from a pre-reserved
+    /// hugepage pool. Requires admin to populate `/proc/sys/vm/nr_hugepages`.
+    /// More aggressive than `MadvHugepage`; fails fast if pool is empty.
+    Hugetlb,
+}
+
+impl SlabAllocator {
+    /// Short slug used in bench ids on disk.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::MadvHugepage => "madvise",
+            Self::Hugetlb => "hugetlb",
+        }
+    }
+
+    /// Parse from an env-var-friendly form. Accepts canonical slugs plus
+    /// common aliases.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "system" | "vec" => Some(Self::System),
+            "madvise" | "madv_hugepage" | "madv-hugepage" => Some(Self::MadvHugepage),
+            "hugetlb" | "map_hugetlb" | "map-hugetlb" => Some(Self::Hugetlb),
+            _ => None,
+        }
+    }
+}
+
+/// What to do with unfilled quantity on a market order.
+/// CME products differ: futures use ImmediateOrCancel (partial fill ok),
+/// some options use FillOrKill (all-or-nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketOrderMode {
+    /// Fill as much as possible; cancel any unfilled remainder. Most common.
+    ImmediateOrCancel,
+    /// Fill everything or fill nothing. If full quantity unavailable, cancel
+    /// and return zero fills.
+    FillOrKill,
 }
 
 /// Outcome of a market order. Carries only `remaining` (the unfilled

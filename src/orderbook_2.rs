@@ -7,7 +7,7 @@ use crate::u64_map::U64Map;
 
 // Shared value types. `pub use` so `calvera_books::orderbook_2::{Price, Side,
 // MarketOrderResult}` keeps resolving for existing call sites.
-pub use crate::types::{MarketOrderResult, Price, Side};
+pub use crate::types::{MarketOrderMode, MarketOrderResult, Price, Side, SlabAllocator};
 
 pub struct OrderBook<C: FillConsumer> {
     // compiler's existing cmov-style dispatch on the match side arms
@@ -27,18 +27,6 @@ pub struct OrderBook<C: FillConsumer> {
     /// `#[inline(always)]`, the call monomorphizes + inlines into the
     /// matching loop. Identical generated code to hardcoding the consumer.
     pub consumer: C,
-}
-
-/// What to do with unfilled quantity on a market order.
-/// CME products differ: futures use ImmediateOrCancel (partial fill ok),
-/// some options use FillOrKill (all-or-nothing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MarketOrderMode {
-    /// Fill as much as possible; cancel any unfilled remainder. Most common.
-    ImmediateOrCancel,
-    /// Fill everything or fill nothing. If full quantity unavailable, cancel
-    /// and return zero fills.
-    FillOrKill,
 }
 
 impl<C: FillConsumer + Default> OrderBook<C> {
@@ -447,13 +435,22 @@ pub struct HalfBook {
 
 impl HalfBook {
     fn with_capacity(side: Side, capacity: usize) -> Self {
-        Self {
+        Self::with_capacity_in(side, capacity, SlabAllocator::System)
+            .expect("SlabAllocator::System never fails")
+    }
+
+    fn with_capacity_in(
+        side: Side,
+        capacity: usize,
+        alloc: SlabAllocator,
+    ) -> BookResult<Self> {
+        Ok(Self {
             side,
             levels: U64Map::default(),
             price_index: BTreeSet::new(),
             best_price: None,
-            slab: OrderSlab::with_capacity(capacity),
-        }
+            slab: OrderSlab::with_capacity_in(capacity, alloc)?,
+        })
     }
 
     /// Alloc a fresh slot in this side's slab, write the order fields,
@@ -640,18 +637,96 @@ impl PriceLevel {
 /// Callers must not read a free slot's matching fields — invariant
 /// maintained by the matcher and by the generation check in
 /// `cancel_limit_order`.
+/// How the slab's backing memory was acquired. Determines what `Drop` does
+/// (system free vs `munmap`). Hot-path code reads `slots[i]` and doesn't
+/// touch this field.
+#[derive(Clone, Copy)]
+enum SlabBacking {
+    System,
+    #[cfg(target_os = "linux")]
+    Mmap { bytes: usize },
+}
+
 pub struct OrderSlab {
     slots: Vec<Order>,
     free_head: Option<SlabIndex>,
     capacity: usize,
+    // Read only inside cfg(linux)'s Drop branch; on macOS the System variant
+    // never needs inspection.
+    #[allow(dead_code)]
+    backing: SlabBacking,
 }
 
 impl OrderSlab {
     pub fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity > 0, "slab capacity must be non-zero");
+        Self::with_capacity_in(capacity, SlabAllocator::System)
+            .expect("SlabAllocator::System never fails")
+    }
 
+    /// Construct a slab with the requested allocator backing. On non-Linux
+    /// platforms the Linux-only variants (`MadvHugepage`, `Hugetlb`) return
+    /// `BookError::UnsupportedAllocator`.
+    pub fn with_capacity_in(capacity: usize, alloc: SlabAllocator) -> BookResult<Self> {
+        assert!(capacity > 0, "slab capacity must be non-zero");
         let total_slots = capacity + 1;
-        let mut slots = Vec::with_capacity(total_slots);
+
+        // Acquire the backing storage. Each branch produces a `Vec<Order>`
+        // pointing at memory of capacity `total_slots`. For mmap-backed
+        // variants the Vec's allocator-ownership is *fake*: we must never
+        // let the Vec free that memory (handled in `Drop`).
+        let (mut slots, backing) = match alloc {
+            SlabAllocator::System => (Vec::with_capacity(total_slots), SlabBacking::System),
+            #[cfg(target_os = "linux")]
+            SlabAllocator::MadvHugepage => unsafe {
+                let bytes = total_slots
+                    .checked_mul(std::mem::size_of::<Order>())
+                    .ok_or(BookError::UnsupportedAllocator)?;
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if ptr == libc::MAP_FAILED {
+                    return Err(BookError::UnsupportedAllocator);
+                }
+                if libc::madvise(ptr, bytes, libc::MADV_HUGEPAGE) != 0 {
+                    libc::munmap(ptr, bytes);
+                    return Err(BookError::UnsupportedAllocator);
+                }
+                // SAFETY: ptr came from mmap with `bytes` capacity in u8;
+                // we re-interpret as `total_slots` Order entries. The Vec
+                // is treated as a fixed-capacity buffer — we never call
+                // any operation that would reallocate. Drop disarms it.
+                let v = Vec::from_raw_parts(ptr as *mut Order, 0, total_slots);
+                (v, SlabBacking::Mmap { bytes })
+            },
+            #[cfg(target_os = "linux")]
+            SlabAllocator::Hugetlb => unsafe {
+                let bytes = total_slots
+                    .checked_mul(std::mem::size_of::<Order>())
+                    .ok_or(BookError::UnsupportedAllocator)?;
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                    -1,
+                    0,
+                );
+                if ptr == libc::MAP_FAILED {
+                    return Err(BookError::UnsupportedAllocator);
+                }
+                let v = Vec::from_raw_parts(ptr as *mut Order, 0, total_slots);
+                (v, SlabBacking::Mmap { bytes })
+            },
+            #[cfg(not(target_os = "linux"))]
+            SlabAllocator::MadvHugepage | SlabAllocator::Hugetlb => {
+                return Err(BookError::UnsupportedAllocator);
+            }
+        };
 
         // SAFETY: 1 is non-zero. Used as the starting generation for every
         // slot — first alloc returns gen=1, subsequent allocs see the
@@ -689,11 +764,12 @@ impl OrderSlab {
             });
         }
 
-        Self {
+        Ok(Self {
             slots,
             free_head: Some(SlabIndex::new(1)),
             capacity,
-        }
+            backing,
+        })
     }
 
     #[inline(always)]
@@ -753,6 +829,27 @@ impl OrderSlab {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+}
+
+impl Drop for OrderSlab {
+    fn drop(&mut self) {
+        // System path: Vec's field destructor runs after this returns and
+        // frees through the system allocator. Nothing to do here.
+        #[cfg(target_os = "linux")]
+        if let SlabBacking::Mmap { bytes } = self.backing {
+            // SAFETY: ptr came from mmap with `bytes` length, exclusively
+            // owned by this slab. We disarm Vec's destructor by overwriting
+            // self.slots with an empty Vec — `ptr::write` doesn't drop the
+            // old value, so the Vec pointing at mmap memory is never freed
+            // through the system allocator (which would be UB). munmap
+            // releases the mapping ourselves.
+            unsafe {
+                let ptr = self.slots.as_mut_ptr() as *mut libc::c_void;
+                std::ptr::write(&mut self.slots, Vec::new());
+                libc::munmap(ptr, bytes);
+            }
+        }
     }
 }
 
@@ -960,5 +1057,53 @@ impl FillConsumer for VecConsumer {
     #[inline(always)]
     fn on_fill(&mut self, fill: Fill) {
         self.fills.push(fill);
+    }
+}
+
+// Variant-agnostic surface. Thin delegation to the inherent methods; the
+// associated `Handle` is this variant's own `OrderHandle` (side-packed).
+impl<C: FillConsumer + Default> crate::api::OrderBookApi for OrderBook<C> {
+    type Handle = OrderHandle;
+
+    #[inline]
+    fn new(slab_capacity: usize) -> Self {
+        OrderBook::new(slab_capacity)
+    }
+
+    fn new_with_alloc(
+        slab_capacity: usize,
+        alloc: SlabAllocator,
+    ) -> BookResult<Self> {
+        let half = slab_capacity / 2;
+        Ok(Self {
+            bids: HalfBook::with_capacity_in(Side::Bid, half, alloc)?,
+            asks: HalfBook::with_capacity_in(Side::Ask, half, alloc)?,
+            consumer: C::default(),
+        })
+    }
+
+    #[inline]
+    fn add_limit(
+        &mut self,
+        side: Side,
+        price: Price,
+        qty: u64,
+    ) -> BookResult<Option<Self::Handle>> {
+        self.add_limit_order(side, price, qty)
+    }
+
+    #[inline]
+    fn add_market(
+        &mut self,
+        side: Side,
+        qty: u64,
+        mode: MarketOrderMode,
+    ) -> BookResult<MarketOrderResult> {
+        self.add_market_order(side, qty, mode)
+    }
+
+    #[inline]
+    fn cancel(&mut self, handle: Self::Handle) -> BookResult<()> {
+        self.cancel_limit_order(handle)
     }
 }
