@@ -768,8 +768,8 @@ pub fn run_warm<S>(w: &Workload<S>, iters: u64) -> std::time::Duration {
 #[allow(dead_code, unused_imports)]
 mod tests {
     use super::*;
-    use calvera_books::orderbook::{OrderBook as OB1, VecConsumer as Vc1};
-    use calvera_books::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
+    use calvera_books::orderbooks::orderbook_legacy::{OrderBook as OB1, VecConsumer as Vc1};
+    use calvera_books::orderbooks::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
 
     /// Same op stream applied to both variants must run without panicking,
     /// and the handle map must end with the expected number of resting

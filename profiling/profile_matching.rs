@@ -24,7 +24,7 @@
 //!   opening_auction  — M6 scenario: deep resting book, slab/index growth
 //!
 //! Variants:
-//!   v1 — orderbook
+//!   v1 — orderbook_legacy
 //!   v2 — orderbook_2
 
 #[path = "../workloads.rs"]
@@ -33,8 +33,8 @@ mod workloads;
 use std::env;
 use std::time::{Duration, Instant};
 
-use calvera_books::orderbook::{OrderBook as OB1, VecConsumer as Vc1};
-use calvera_books::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
+use calvera_books::orderbooks::orderbook_legacy::{OrderBook as OB1, VecConsumer as Vc1};
+use calvera_books::orderbooks::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
 use calvera_books::types::SlabAllocator;
 
 use workloads::{

@@ -2,7 +2,7 @@
 //!
 //! The scenarios live once, generic over `B: ParityBook`, in `common/mod.rs`.
 //! This file stamps out a `#[test]` per scenario for each variant (`v1` =
-//! `orderbook`, `v2` = `orderbook_2`) via the `parity_suite!` macro, so both
+//! `orderbook_legacy`, `v2` = `orderbook_2`) via the `parity_suite!` macro, so both
 //! engines run the identical suite and any divergence surfaces as a failing
 //! test. Adding a scenario = one generic fn in `common` + one line in the
 //! macro body; adding a variant = one `parity_suite!` invocation.
@@ -135,11 +135,11 @@ macro_rules! parity_suite {
 
 parity_suite!(
     v1,
-    calvera_books::orderbook::OrderBook<calvera_books::orderbook::VecConsumer>
+    calvera_books::orderbooks::orderbook_legacy::OrderBook<calvera_books::orderbooks::orderbook_legacy::VecConsumer>
 );
 parity_suite!(
     v2,
-    calvera_books::orderbook_2::OrderBook<calvera_books::orderbook_2::VecConsumer>
+    calvera_books::orderbooks::orderbook_2::OrderBook<calvera_books::orderbooks::orderbook_2::VecConsumer>
 );
 
 // ---------------------------------------------------------------------------
@@ -156,8 +156,8 @@ mod scenario_parity {
     use super::common;
     use super::common::scenarios::{self, Scenario};
 
-    type V1 = calvera_books::orderbook::OrderBook<calvera_books::orderbook::VecConsumer>;
-    type V2 = calvera_books::orderbook_2::OrderBook<calvera_books::orderbook_2::VecConsumer>;
+    type V1 = calvera_books::orderbooks::orderbook_legacy::OrderBook<calvera_books::orderbooks::orderbook_legacy::VecConsumer>;
+    type V2 = calvera_books::orderbooks::orderbook_2::OrderBook<calvera_books::orderbooks::orderbook_2::VecConsumer>;
 
     #[test]
     fn variants_agree_on_scenario_fills() {

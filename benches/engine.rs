@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use calvera_books::orderbook::{OrderBook as OB1, VecConsumer as Vc1};
-use calvera_books::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
+use calvera_books::orderbooks::orderbook_legacy::{OrderBook as OB1, VecConsumer as Vc1};
+use calvera_books::orderbooks::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
 use calvera_books::types::SlabAllocator;
 
 use workloads::{

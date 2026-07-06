@@ -5,8 +5,8 @@ use std::num::{NonZeroU32, NonZeroU64};
 use crate::errors::{BookError, BookResult};
 use crate::u64_map::U64Map;
 
-// Shared value types. `pub use` so `calvera_books::orderbook_2::{Price, Side,
-// MarketOrderResult}` keeps resolving for existing call sites.
+// Shared value types. `pub use` so `calvera_books::orderbooks::orderbook_2::
+// {Price, Side, MarketOrderResult}` keeps resolving for existing call sites.
 pub use crate::types::{MarketOrderMode, MarketOrderResult, Price, Side, SlabAllocator};
 
 pub struct OrderBook<C: FillConsumer> {

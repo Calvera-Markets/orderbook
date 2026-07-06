@@ -1,6 +1,6 @@
 //! Shared, variant-agnostic parity suite (M2.5).
 //!
-//! Both `orderbook` (v1) and `orderbook_2` (v2) implement `OrderBookApi` with
+//! Both `orderbook_legacy` (v1) and `orderbook_2` (v2) implement `OrderBookApi` with
 //! identical behaviour, so the behavioural/stress scenarios that used to be
 //! copy-pasted between `parity.rs` and `parity_2.rs` (~1230 near-identical
 //! lines each) now live here **once**, generic over `B: ParityBook`. The
@@ -49,7 +49,7 @@ pub trait FillSource: OrderBookApi {
     fn clear_fills(&mut self);
 }
 
-impl FillSource for calvera_books::orderbook::OrderBook<calvera_books::orderbook::VecConsumer> {
+impl FillSource for calvera_books::orderbooks::orderbook_legacy::OrderBook<calvera_books::orderbooks::orderbook_legacy::VecConsumer> {
     fn fill_snapshot(&self) -> Vec<(Self::Handle, u64)> {
         self.consumer
             .fills
@@ -66,7 +66,7 @@ impl FillSource for calvera_books::orderbook::OrderBook<calvera_books::orderbook
 }
 
 impl FillSource
-    for calvera_books::orderbook_2::OrderBook<calvera_books::orderbook_2::VecConsumer>
+    for calvera_books::orderbooks::orderbook_2::OrderBook<calvera_books::orderbooks::orderbook_2::VecConsumer>
 {
     fn fill_snapshot(&self) -> Vec<(Self::Handle, u64)> {
         self.consumer

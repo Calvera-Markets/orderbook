@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 
 use calvera::{BusySpin, Producer, UniConsumerBarrier, UniProducer, build_uni_producer_unchecked};
-use calvera_books::orderbook::{
+use calvera_books::orderbooks::orderbook_legacy::{
     Fill, FillConsumer, MarketOrderMode, OrderBook, OrderHandle, Price, Side,
 };
 use criterion::{
