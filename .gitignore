@@ -7,3 +7,5 @@
 profiling/flamegraph/*
 profiling/logs/*
 benches/logs/*
+
+local/*
