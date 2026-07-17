@@ -40,6 +40,11 @@ one engine-visible addition is the slab allocator axis).
   import) collapsed into one generic suite in `tests/common` that runs the same
   28 scenarios against both variants (56 tests). Adds a cross-variant check that
   the same scenario Event stream yields identical fills on v1 and v2.
+- **Databento tape replay** (`examples/tape_replay.rs`): one-shot harness that
+  decodes an MBO `.dbn.zst` (A/C/M) and replays it through v1/v2 — the
+  ordertruques throughput + per-op latency experiment. Modify is emulated as
+  cancel+add. `--synthetic N` smokes the same path without a tape. Not a
+  criterion bench: one pass, per-op histogram, wall-clock Mops.
 
 ---
 

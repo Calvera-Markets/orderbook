@@ -18,6 +18,8 @@ rand_chacha = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 calvera = { git = "https://github.com/kaizu-xyz/calvera.git", branch = "main" }
+# MBO tapes. Default features include zstd (needed for `.dbn.zst`).
+dbn = "0.66"
 
 [[bench]]
 name = "engine"
@@ -34,3 +36,7 @@ path = "profiling/profile_matching.rs"
 [[example]]
 name = "report"
 path = "examples/report.rs"
+
+[[example]]
+name = "tape_replay"
+path = "examples/tape_replay.rs"

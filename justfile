@@ -82,6 +82,12 @@ profile-all:
 profile-view WORKLOAD VARIANT DURATION="20":
     ./bin/view-samply.sh {{WORKLOAD}} {{VARIANT}} {{DURATION}}
 
+# Replay a Databento MBO tape (or a synthetic stand-in) against v1 and v2.
+# Real tape:  just tape-replay --tape path/to/xnas-itch-20251110.mbo.dbn.zst
+# Smoke:      just tape-replay --synthetic 200000
+tape-replay *FLAGS:
+    cargo run --release --quiet --example tape_replay -- {{FLAGS}}
+
 # Open a flamegraph SVG (from the latest run). Tag format: <variant>-<workload>.
 # Example: just flamegraph v1-mixed
 flamegraph TAG:

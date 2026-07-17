@@ -165,6 +165,16 @@ produce identical fills (`tests/parity.rs::scenario_parity`).
 - **`opening_auction`** — deep resting book (mm_depth 50). Stresses the slab and
   index at higher occupancy.
 
+## Tape replay (`just tape-replay`)
+
+10 M synthetic A/C/M ops, ~4 k live book. Apple Silicon, 2026-08-17.
+`--no-latency` for throughput. ordertruques (real NVDA tape, Ryzen): 14.37 M/s.
+
+| Impl | M ops/s | ns/op | P99 | P99.9 |
+| ---- | ------: | ----: | --: | ----: |
+| v1   |   35.96 |  27.8 | 125 ns | 709 ns |
+| v2   |   34.50 |  29.0 |  84 ns | 250 ns |
+
 ## Notes on noise and methodology
 
 - **Only the steady-state loop is timed.** Allocation, first-touch, population,
