@@ -121,6 +121,7 @@ impl<C: FillConsumer> OrderBook<C> {
 
         'sweep: while remaining > 0 {
             // 1) Best price on the opposite side.
+            //    Rare miss; the branch *skips* the sweep. Leave it.
             let fill_price = match opposite.best_price {
                 Some(p) => p,
                 None => break,
@@ -130,6 +131,9 @@ impl<C: FillConsumer> OrderBook<C> {
             //    Direction is const after monomorphisation: Bid aggressor
             //    (opp_is_ask) crosses when `limit >= ask`, Ask aggressor
             //    when `limit <= bid`.
+            //    Candidate for a cmov-into-done flag if a profile shows this
+            //    flipping near the touch. Far-from-touch and market (`None`)
+            //    predict well.
             if let Some(limit) = price_limit {
                 let crosses = if OPP_IS_ASK {
                     limit >= fill_price
@@ -179,13 +183,15 @@ impl<C: FillConsumer> OrderBook<C> {
                     let resting_handle = OrderHandle::new(opp_side, current_idx, slot.generation);
                     let next_idx = slot.next;
 
-                    let fill_qty = remaining.min(resting_qty);
+                    let fill_qty = remaining.min(resting_qty); // cmov
                     remaining -= fill_qty;
                     self.consumer.on_fill(Fill {
                         resting_id: resting_handle,
                         quantity: fill_qty,
                     });
 
+                    // Full vs partial: data-dependent. Sweeps are mostly
+                    // full-consume (predictor is fine).
                     if fill_qty == resting_qty {
                         // Full consume. Donate to this level's freed chain
                         // (no link write — already linked via `Order.next`).
@@ -355,6 +361,7 @@ impl<C: FillConsumer> OrderBook<C> {
         };
 
         let slot = &own.slab.slots[idx.as_usize()];
+        // Almost always hit; miss is the error path. No cmov needed
         if slot.generation != generation {
             return Err(BookError::OrderNotFound);
         }
@@ -439,11 +446,7 @@ impl HalfBook {
             .expect("SlabAllocator::System never fails")
     }
 
-    fn with_capacity_in(
-        side: Side,
-        capacity: usize,
-        alloc: SlabAllocator,
-    ) -> BookResult<Self> {
+    fn with_capacity_in(side: Side, capacity: usize, alloc: SlabAllocator) -> BookResult<Self> {
         Ok(Self {
             side,
             levels: U64Map::default(),
@@ -488,6 +491,7 @@ impl HalfBook {
 
             if level.is_empty() {
                 self.levels.remove(&price);
+                // Cold: only when a level dies
                 self.price_index.remove(&price);
 
                 // Refresh the best price if needed
@@ -517,7 +521,6 @@ impl HalfBook {
         let price_index = &mut self.price_index;
         let price = slab.get(idx).price;
 
-        // Get or insert level
         let level = levels.entry(price).or_insert_with(|| {
             // Add new price set
             price_index.insert(price);
@@ -577,7 +580,7 @@ impl PriceLevel {
             (o.prev, o.next, o.quantity)
         };
 
-        // Patch the previous order's `next` pointer.
+        // Head/mid/tail is predictable; both arms are one store. No cmov needed
         match prev {
             // Stich previous to next
             Some(p_idx) => slab.get_mut(p_idx).next = next,
@@ -644,7 +647,9 @@ impl PriceLevel {
 enum SlabBacking {
     System,
     #[cfg(target_os = "linux")]
-    Mmap { bytes: usize },
+    Mmap {
+        bytes: usize,
+    },
 }
 
 pub struct OrderSlab {
@@ -1070,10 +1075,7 @@ impl<C: FillConsumer + Default> crate::api::OrderBookApi for OrderBook<C> {
         OrderBook::new(slab_capacity)
     }
 
-    fn new_with_alloc(
-        slab_capacity: usize,
-        alloc: SlabAllocator,
-    ) -> BookResult<Self> {
+    fn new_with_alloc(slab_capacity: usize, alloc: SlabAllocator) -> BookResult<Self> {
         let half = slab_capacity / 2;
         Ok(Self {
             bids: HalfBook::with_capacity_in(Side::Bid, half, alloc)?,

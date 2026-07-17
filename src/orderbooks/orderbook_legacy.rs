@@ -64,6 +64,8 @@ impl<C: FillConsumer> OrderBook<C> {
         quantity: u64,
     ) -> BookResult<u64> {
         // TODO: This function needs a cleanup
+        // Runtime `side` select below: do not cmov it.
+        // A live opposite-ptr across this inlined body spilled SIMD regs.
         let mut remaining = quantity;
         let mut freed_chain_head: Option<SlabIndex> = None;
         let mut freed_chain_tail: Option<SlabIndex> = None;
@@ -74,12 +76,16 @@ impl<C: FillConsumer> OrderBook<C> {
                 Side::Bid => self.asks.best_price,
                 Side::Ask => self.bids.best_price,
             };
+            // Rare miss; the branch *skips* the sweep. Leave it.
             let fill_price = match best_opposite {
                 Some(p) => p,
                 None => break,
             };
 
             // 2) Limit-order stop condition: bail if our price no longer crosses.
+            //    Candidate for a cmov-into-done flag if a profile shows this
+            //    flipping near the touch. Far-from-touch and market (`None`)
+            //    predict well.
             if let Some(limit) = price_limit {
                 let crosses = match side {
                     Side::Bid => limit >= fill_price,
@@ -127,13 +133,16 @@ impl<C: FillConsumer> OrderBook<C> {
                     let resting_handle = OrderHandle::new(current_idx, slot.generation);
                     let next_idx = slot.next;
 
-                    let fill_qty = remaining.min(resting_qty);
+                    let fill_qty = remaining.min(resting_qty); // cmov
                     remaining -= fill_qty;
                     self.consumer.on_fill(Fill {
                         resting_id: resting_handle,
                         quantity: fill_qty,
                     });
 
+                    // Full vs partial: data-dependent. Sweeps are mostly
+                    // full-consume (predictor is fine). Only de-branch if a
+                    // flamegraph pins this compare.
                     if fill_qty == resting_qty {
                         // Full consume. Donate to this level's freed chain
                         // (no link write — already linked via `Order.next`).
@@ -297,6 +306,7 @@ impl<C: FillConsumer> OrderBook<C> {
         let generation = handle.generation();
 
         let slot = &self.slab.slots[idx.as_usize()];
+        // Almost always hit; miss is the error path. Don't cmov.
         if slot.generation != generation {
             return Err(BookError::OrderNotFound);
         }
@@ -402,6 +412,7 @@ impl HalfBook {
 
             if level.is_empty() {
                 self.levels.remove(&price);
+                // Cold: only when a level dies.
                 self.price_index.remove(&price);
 
                 // Refresh the best price if needed
@@ -429,7 +440,7 @@ impl HalfBook {
     ) {
         let price = slab.get(idx).price;
 
-        // Get or insert level
+        // Hash probe + possible alloc — not a 2-way select.
         let level = self.levels.entry(price).or_insert_with(|| {
             // Add new price set
             self.price_index.insert(price);
@@ -489,7 +500,7 @@ impl PriceLevel {
             (o.prev, o.next, o.quantity)
         };
 
-        // Patch the previous order's `next` pointer.
+        // Head/mid/tail is predictable; both arms are one store. Don't cmov.
         match prev {
             // Stich previous to next
             Some(p_idx) => slab.get_mut(p_idx).next = next,
@@ -556,7 +567,9 @@ impl PriceLevel {
 enum SlabBacking {
     System,
     #[cfg(target_os = "linux")]
-    Mmap { bytes: usize },
+    Mmap {
+        bytes: usize,
+    },
 }
 
 pub struct OrderSlab {
@@ -956,10 +969,7 @@ impl<C: FillConsumer + Default> crate::api::OrderBookApi for OrderBook<C> {
         OrderBook::new(slab_capacity)
     }
 
-    fn new_with_alloc(
-        slab_capacity: usize,
-        alloc: SlabAllocator,
-    ) -> BookResult<Self> {
+    fn new_with_alloc(slab_capacity: usize, alloc: SlabAllocator) -> BookResult<Self> {
         Ok(Self {
             bids: HalfBook::new(Side::Bid),
             asks: HalfBook::new(Side::Ask),
