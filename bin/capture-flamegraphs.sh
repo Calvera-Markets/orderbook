@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture one flamegraph per (workload × variant) combo.
+# Capture one flamegraph per workload.
 #
 # Builds the `profile_matching` example, runs each combo for `DUR_RUN`
 # seconds, samples it for `DUR_SAMPLE` seconds with macOS `sample`, and writes
@@ -9,9 +9,9 @@
 # subfolder under both flamegraph/ and logs/. Output layout:
 #
 #   crates/calvera-books/profiling/
-#     flamegraph/<RUN_ID>/flamegraph-<variant>-<workload>.svg
-#     logs/<RUN_ID>/<variant>-<workload>.log              ← throughput / stdout
-#     logs/<RUN_ID>/<variant>-<workload>.sample.txt       ← Apple `sample` raw
+#     flamegraph/<RUN_ID>/flamegraph-<workload>.svg
+#     logs/<RUN_ID>/<workload>.log              ← throughput / stdout
+#     logs/<RUN_ID>/<workload>.sample.txt       ← Apple `sample` raw
 #
 # Combos map 1:1 to bench IDs in benches/engine.rs. Extend together with M3.3
 # as new workloads are added.
@@ -40,14 +40,10 @@ mkdir -p "$FLAMEGRAPH_RUN_DIR" "$LOG_RUN_DIR"
 DUR_RUN=${DUR_RUN:-12}
 DUR_SAMPLE=${DUR_SAMPLE:-8}
 
-# (workload, variant) combos, one per line as "workload:variant".
 COMBOS=(
-  "mixed:v1"
-  "mixed:v2"
-  "add_cancel:v1"
-  "add_cancel:v2"
-  "calm_market:v1"
-  "calm_market:v2"
+  "mixed"
+  "add_cancel"
+  "calm_market"
 )
 
 echo "→ building profile_matching (release)..."
@@ -59,10 +55,8 @@ echo "→ run-id: $RUN_ID"
 echo "→ profiling ${#COMBOS[@]} combos (${DUR_RUN}s each, ${DUR_SAMPLE}s sampled)..."
 SUMMARY=()
 
-for COMBO in "${COMBOS[@]}"; do
-  WORKLOAD="${COMBO%%:*}"
-  VARIANT="${COMBO##*:}"
-  TAG="${VARIANT}-${WORKLOAD}"
+for WORKLOAD in "${COMBOS[@]}"; do
+  TAG="$WORKLOAD"
   echo ""
   echo "  [$TAG]"
 
@@ -70,7 +64,7 @@ for COMBO in "${COMBOS[@]}"; do
   STDOUT_LOG="$LOG_RUN_DIR/${TAG}.log"
   SVG="$FLAMEGRAPH_RUN_DIR/flamegraph-${TAG}.svg"
 
-  "$BIN" "$WORKLOAD" "$VARIANT" "$DUR_RUN" > "$STDOUT_LOG" 2>&1 &
+  "$BIN" "$WORKLOAD" "$DUR_RUN" > "$STDOUT_LOG" 2>&1 &
   PID=$!
   sample "$PID" "$DUR_SAMPLE" -file "$SAMPLE_TXT" > /dev/null 2>&1
   wait "$PID"
@@ -80,7 +74,7 @@ for COMBO in "${COMBOS[@]}"; do
         --title "calvera-books: $TAG — run $RUN_ID (${DUR_RUN}s run, ${DUR_SAMPLE}s sampled)" \
     > "$SVG"
 
-  SUMMARY_LINE=$(grep -E "^${VARIANT}/" "$STDOUT_LOG" || cat "$STDOUT_LOG")
+  SUMMARY_LINE=$(grep -E "^${WORKLOAD}:" "$STDOUT_LOG" || cat "$STDOUT_LOG")
   echo "  → $SVG"
   echo "  $SUMMARY_LINE"
   SUMMARY+=("$SUMMARY_LINE")
@@ -91,10 +85,8 @@ echo "================================================================"
 echo "done. run-id: $RUN_ID"
 echo ""
 echo "flamegraphs:"
-for COMBO in "${COMBOS[@]}"; do
-  WORKLOAD="${COMBO%%:*}"
-  VARIANT="${COMBO##*:}"
-  echo "  $FLAMEGRAPH_RUN_DIR/flamegraph-${VARIANT}-${WORKLOAD}.svg"
+for WORKLOAD in "${COMBOS[@]}"; do
+  echo "  $FLAMEGRAPH_RUN_DIR/flamegraph-${WORKLOAD}.svg"
 done
 echo ""
 echo "logs:"

@@ -30,12 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use calvera_books::api::OrderBookApi;
-use calvera_books::orderbooks::orderbook_2::{
-    Fill as Fill2, FillConsumer as FillConsumer2, OrderBook as OB2,
-};
-use calvera_books::orderbooks::orderbook_legacy::{
-    Fill as Fill1, FillConsumer as FillConsumer1, OrderBook as OB1,
-};
+use calvera_books::orderbook::{Fill, FillConsumer, OrderBook};
 use calvera_books::types::{Price, Side, SlabAllocator};
 
 // ---------------------------------------------------------------------------
@@ -45,14 +40,9 @@ use calvera_books::types::{Price, Side, SlabAllocator};
 #[derive(Default)]
 struct NullConsumer;
 
-impl FillConsumer1 for NullConsumer {
+impl FillConsumer for NullConsumer {
     #[inline(always)]
-    fn on_fill(&mut self, _: Fill1) {}
-}
-
-impl FillConsumer2 for NullConsumer {
-    #[inline(always)]
-    fn on_fill(&mut self, _: Fill2) {}
+    fn on_fill(&mut self, _: Fill) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -495,17 +485,9 @@ fn calibrate_rdtsc() -> f64 {
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImplChoice {
-    V1,
-    V2,
-    Both,
-}
-
 struct Config {
     tape: Option<PathBuf>,
     synthetic: Option<usize>,
-    which: ImplChoice,
     slab: usize,
     alloc: SlabAllocator,
     warmup: usize,
@@ -528,7 +510,6 @@ Usage:
 Options:
   --tape <path>         Databento `.dbn.zst` (or env TAPE)
   --synthetic <n>       Generate n add/cancel ops instead of decoding a file
-  --impl v1|v2|both     Engine variant (default: both)
   --slab <n>            Slab capacity (default: 20M for a tape, 2N for --synthetic)
   --alloc system|madvise|hugetlb
   --warmup <n>          Untimed prefix, then drain (default: 100000)
@@ -545,7 +526,6 @@ Options:
 fn parse_args() -> Config {
     let mut tape = std::env::var_os("TAPE").map(PathBuf::from);
     let mut synthetic = None;
-    let mut which = ImplChoice::Both;
     let mut slab = None;
     let mut alloc = SlabAllocator::System;
     let mut warmup = 100_000usize;
@@ -571,17 +551,6 @@ fn parse_args() -> Config {
             "--tape" => tape = Some(PathBuf::from(take(&mut args, "--tape"))),
             "--synthetic" => {
                 synthetic = Some(parse_usize(&take(&mut args, "--synthetic"), "--synthetic"));
-            }
-            "--impl" => {
-                which = match take(&mut args, "--impl").as_str() {
-                    "v1" => ImplChoice::V1,
-                    "v2" => ImplChoice::V2,
-                    "both" => ImplChoice::Both,
-                    other => {
-                        eprintln!("unknown --impl {other}");
-                        std::process::exit(2);
-                    }
-                };
             }
             "--slab" => slab = Some(parse_usize(&take(&mut args, "--slab"), "--slab")),
             "--alloc" => {
@@ -630,7 +599,6 @@ fn parse_args() -> Config {
     Config {
         tape,
         synthetic,
-        which,
         slab,
         alloc,
         warmup,
@@ -867,12 +835,5 @@ fn main() {
     let clock = ReplayClock::new(Clock::detect());
     println!("clock:        {}", clock.name());
 
-    match cfg.which {
-        ImplChoice::V1 => run_impl::<OB1<NullConsumer>>("v1", &ops, &cfg, &clock),
-        ImplChoice::V2 => run_impl::<OB2<NullConsumer>>("v2", &ops, &cfg, &clock),
-        ImplChoice::Both => {
-            run_impl::<OB1<NullConsumer>>("v1", &ops, &cfg, &clock);
-            run_impl::<OB2<NullConsumer>>("v2", &ops, &cfg, &clock);
-        }
-    }
+    run_impl::<OrderBook<NullConsumer>>("orderbook", &ops, &cfg, &clock);
 }

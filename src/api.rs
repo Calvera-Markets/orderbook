@@ -1,13 +1,8 @@
-//! The variant-agnostic order-book surface.
+//! The order-book surface used by benches, workloads, and the parity harness.
 //!
-//! Every `OrderBook` variant implements `OrderBookApi` so the bench runner,
-//! workloads, and parity harness can be generic over the implementation
-//! without caring which matcher (or which handle encoding) is underneath.
-//!
-//! The handle is an associated type, not a shared concrete type: its bit
-//! layout is the engine's business (v1 has no side bit, v2 packs the side),
-//! and callers treat it opaquely — get one from `add_limit`, hand it back to
-//! `cancel`.
+//! The handle is an associated type: its bit layout is the engine's
+//! business, and callers treat it opaquely — get one from `add_limit`,
+//! hand it back to `cancel`.
 
 use crate::errors::BookResult;
 use crate::types::{MarketOrderMode, MarketOrderResult, Price, SlabAllocator, Side};

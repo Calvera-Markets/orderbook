@@ -1,22 +1,11 @@
 #!/usr/bin/env bash
-# Open the Firefox Profiler interactive view for a given (workload × variant).
-#
-# Records a fresh symbolicated samply profile of the `profile_matching`
-# example for the given combo, then serves it via the Firefox Profiler web UI.
-# Visit the URL it prints (usually http://127.0.0.1:3000) in any browser —
-# you get the full Firefox Profiler interface: flamegraph, call tree,
-# inverted call tree, timeline, search.
+# Open the Firefox Profiler interactive view for a workload.
 #
 # Usage:
-#   ./view-samply.sh <workload> <variant> [duration]
-#
-# Workloads (same as benches/engine.rs):
-#   mixed       add_cancel
-# Variants:
-#   v1          v2
+#   ./view-samply.sh <workload> [duration]
 #
 # Env knobs:
-#   DURATION   how long to record (default 20s; can also pass as 3rd arg)
+#   DURATION   how long to record (default 20s; can also pass as 2nd arg)
 #
 # Requirements:
 #   cargo install samply
@@ -24,16 +13,14 @@
 set -euo pipefail
 
 WORKLOAD=${1:-}
-VARIANT=${2:-}
-if [ -z "$WORKLOAD" ] || [ -z "$VARIANT" ]; then
-  echo "usage: $0 <workload> <variant> [duration]" >&2
-  echo "  workloads: mixed | add_cancel" >&2
-  echo "  variants:  v1 | v2" >&2
+if [ -z "$WORKLOAD" ]; then
+  echo "usage: $0 <workload> [duration]" >&2
+  echo "  workloads: mixed | add_cancel | ..." >&2
   exit 1
 fi
 
-DURATION="${3:-${DURATION:-20}}"
-TAG="${VARIANT}-${WORKLOAD}"
+DURATION="${2:-${DURATION:-20}}"
+TAG="$WORKLOAD"
 
 cd "$(dirname "$0")"
 CRATE_ROOT="$(cd .. && pwd)"
@@ -50,7 +37,7 @@ echo "→ recording ${TAG} for ${DURATION}s..."
 samply record \
   --save-only \
   -o "$PROFILE_JSON" \
-  "$ROOT/target/release/examples/profile_matching" "$WORKLOAD" "$VARIANT" "$DURATION"
+  "$ROOT/target/release/examples/profile_matching" "$WORKLOAD" "$DURATION"
 
 echo ""
 echo "→ serving via Firefox Profiler (Ctrl+C to stop)..."

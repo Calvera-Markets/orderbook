@@ -1,7 +1,5 @@
-//! Generic engine bench. One bench binary, every (impl × workload)
-//! combination. Eventually replaces `orderbook*.rs` per-variant bench files
-//! (M4.3). Workload definitions live in `../workloads.rs` (single source of
-//! truth, shared with tests and the profiler).
+//! Generic engine bench. One bench binary, every workload.
+//! Workload definitions live in `../workloads.rs`.
 
 #[path = "../workloads.rs"]
 mod workloads;
@@ -10,8 +8,7 @@ use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use calvera_books::orderbooks::orderbook_legacy::{OrderBook as OB1, VecConsumer as Vc1};
-use calvera_books::orderbooks::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
+use calvera_books::orderbook::{OrderBook, VecConsumer};
 use calvera_books::types::SlabAllocator;
 
 use workloads::{
@@ -36,9 +33,8 @@ fn parse_slab_cap(s: &str) -> Option<usize> {
 /// once per benchmark inside the bench closure (untimed); only the inner
 /// `iters` calls to `hot` are timed.
 ///
-/// Bench id reflects every non-default axis so cross-axis sweeps don't
-/// collide in criterion's baseline cache: `impl/workload[/cap_N][/alloc_K]`.
-fn bench_workload<S>(c: &mut Criterion, label: &str, w: Workload<S>) {
+/// Bench id: `workload[/cap_N][/alloc_K]`.
+fn bench_workload<S>(c: &mut Criterion, w: Workload<S>) {
     let slab_cap = std::env::var("BENCH_SLAB_CAP")
         .ok()
         .and_then(|s| parse_slab_cap(&s))
@@ -48,7 +44,7 @@ fn bench_workload<S>(c: &mut Criterion, label: &str, w: Workload<S>) {
         .and_then(|s| SlabAllocator::parse(&s))
         .unwrap_or(SlabAllocator::System);
 
-    let mut id = format!("{}/{}", label, w.name);
+    let mut id = w.name.to_string();
     if slab_cap != w.slab_cap {
         id.push_str(&format!("/cap_{}", slab_cap));
     }
@@ -56,8 +52,6 @@ fn bench_workload<S>(c: &mut Criterion, label: &str, w: Workload<S>) {
         id.push_str(&format!("/alloc_{}", alloc.slug()));
     }
 
-    // Build state up-front so we can skip the bench cleanly if the
-    // allocator isn't supported on this platform.
     let state_result = (w.setup)(slab_cap, alloc);
     let mut state = match state_result {
         Ok(s) => s,
@@ -71,8 +65,6 @@ fn bench_workload<S>(c: &mut Criterion, label: &str, w: Workload<S>) {
     };
 
     c.bench_function(&id, move |b| {
-        // Soft prefault: real engine work that touches slab pages + warms
-        // HashMap buckets we'll hit in the timed body.
         for _ in 0..w.warmup_iters {
             (w.hot)(&mut state);
         }
@@ -86,32 +78,19 @@ fn bench_workload<S>(c: &mut Criterion, label: &str, w: Workload<S>) {
     });
 }
 
-/// Registry of (impl, workload) pairs. Adding a new variant or workload is
-/// one line here.
 fn run(c: &mut Criterion) {
-    bench_workload(c, "v1", mixed_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", mixed_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", add_cancel_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", add_cancel_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", add_spread_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", add_spread_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", cancel_heavy_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", cancel_heavy_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", match_single_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", match_single_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", sweep_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", sweep_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", deep_book_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", deep_book_workload::<OB2<Vc2>>());
-    // M6 scenario layer.
-    bench_workload(c, "v1", calm_market_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", calm_market_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", news_event_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", news_event_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", illiquid_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", illiquid_workload::<OB2<Vc2>>());
-    bench_workload(c, "v1", opening_auction_workload::<OB1<Vc1>>());
-    bench_workload(c, "v2", opening_auction_workload::<OB2<Vc2>>());
+    type Book = OrderBook<VecConsumer>;
+    bench_workload(c, mixed_workload::<Book>());
+    bench_workload(c, add_cancel_workload::<Book>());
+    bench_workload(c, add_spread_workload::<Book>());
+    bench_workload(c, cancel_heavy_workload::<Book>());
+    bench_workload(c, match_single_workload::<Book>());
+    bench_workload(c, sweep_workload::<Book>());
+    bench_workload(c, deep_book_workload::<Book>());
+    bench_workload(c, calm_market_workload::<Book>());
+    bench_workload(c, news_event_workload::<Book>());
+    bench_workload(c, illiquid_workload::<Book>());
+    bench_workload(c, opening_auction_workload::<Book>());
 }
 
 criterion_group!(engine, run);

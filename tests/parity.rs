@@ -1,11 +1,7 @@
-//! Behavioural and stress parity suite for both order-book variants.
+//! Behavioural and stress suite.
 //!
-//! The scenarios live once, generic over `B: ParityBook`, in `common/mod.rs`.
-//! This file stamps out a `#[test]` per scenario for each variant (`v1` =
-//! `orderbook_legacy`, `v2` = `orderbook_2`) via the `parity_suite!` macro, so both
-//! engines run the identical suite and any divergence surfaces as a failing
-//! test. Adding a scenario = one generic fn in `common` + one line in the
-//! macro body; adding a variant = one `parity_suite!` invocation.
+//! Scenarios live once, generic over `B: ParityBook`, in `common/mod.rs`.
+//! This file stamps out a `#[test]` per scenario.
 
 mod common;
 
@@ -134,51 +130,6 @@ macro_rules! parity_suite {
 }
 
 parity_suite!(
-    v1,
-    calvera_books::orderbooks::orderbook_legacy::OrderBook<calvera_books::orderbooks::orderbook_legacy::VecConsumer>
+    book,
+    calvera_books::orderbook::OrderBook<calvera_books::orderbook::VecConsumer>
 );
-parity_suite!(
-    v2,
-    calvera_books::orderbooks::orderbook_2::OrderBook<calvera_books::orderbooks::orderbook_2::VecConsumer>
-);
-
-// ---------------------------------------------------------------------------
-// M6.6 — cross-variant correctness over scenario streams.
-//
-// The per-variant `parity_suite!` proves each engine matches hand-written
-// expectations. This proves the two engines agree with *each other* on a
-// realistic, generated stream: the same scenario Events, replayed against both,
-// must produce byte-identical fill sequences (translated to logical ids). Any
-// divergence in matching order, partial-fill handling, or level bookkeeping
-// surfaces here.
-// ---------------------------------------------------------------------------
-mod scenario_parity {
-    use super::common;
-    use super::common::scenarios::{self, Scenario};
-
-    type V1 = calvera_books::orderbooks::orderbook_legacy::OrderBook<calvera_books::orderbooks::orderbook_legacy::VecConsumer>;
-    type V2 = calvera_books::orderbooks::orderbook_2::OrderBook<calvera_books::orderbooks::orderbook_2::VecConsumer>;
-
-    #[test]
-    fn variants_agree_on_scenario_fills() {
-        for scenario in scenarios::all() {
-            let events = scenario.generate(4096);
-            let f1 = common::run_scenario_fills::<V1>(&events);
-            let f2 = common::run_scenario_fills::<V2>(&events);
-            assert_eq!(
-                f1,
-                f2,
-                "v1/v2 fill divergence on scenario `{}` ({} vs {} fills)",
-                scenario.name(),
-                f1.len(),
-                f2.len(),
-            );
-            // Sanity: the stream actually exercises matching.
-            assert!(
-                !f1.is_empty(),
-                "scenario `{}` produced no fills — not exercising the matcher",
-                scenario.name(),
-            );
-        }
-    }
-}

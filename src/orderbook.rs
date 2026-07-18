@@ -5,8 +5,6 @@ use std::num::{NonZeroU32, NonZeroU64};
 use crate::errors::{BookError, BookResult};
 use crate::u64_map::U64Map;
 
-// Shared value types. `pub use` so `calvera_books::orderbooks::orderbook_2::
-// {Price, Side, MarketOrderResult}` keeps resolving for existing call sites.
 pub use crate::types::{MarketOrderMode, MarketOrderResult, Price, Side, SlabAllocator};
 
 pub struct OrderBook<C: FillConsumer> {
@@ -862,6 +860,10 @@ impl Drop for OrderSlab {
 ///
 /// Mechanical Sympathy: Layout is exactly 32 bytes
 /// With 64 B cache lines that means two `Order`s per line.
+/// A same-side FIFO walk is sequential in this per-side slab under bursty
+/// allocs, so each line fill delivers the current slot *and* the next —
+/// one miss, two orders. Padding to 64 B would double line traffic.
+/// False sharing is a non-issue: the matcher is one thread.
 ///
 /// `#[repr(C, align(32))]` pins both the field layout and the struct
 /// alignment to 32, so a `Vec<Order>` is guaranteed to start at a 32-byte

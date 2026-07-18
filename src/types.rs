@@ -1,10 +1,7 @@
-//! Genuinely encoding-agnostic value types shared across all `OrderBook`
-//! variants. No design opinion lives here.
+//! Encoding-agnostic value types. No book-layout opinion lives here.
 //!
-//! Deliberately excluded: `OrderHandle` (its bit layout is variant-specific —
-//! v1 has no side bit, v2 packs the side), `SlabIndex`, and `Fill`. Those stay
-//! in each variant module; the framework abstracts the handle through the
-//! `OrderBookApi::Handle` associated type rather than a shared concrete type.
+//! `OrderHandle`, `SlabIndex`, and `Fill` stay in `orderbook` — the
+//! framework abstracts the handle through `OrderBookApi::Handle`.
 
 /// Fixed-point price. 1 unit = 1 tick of the instrument.
 /// All price arithmetic is integer arithmetic.

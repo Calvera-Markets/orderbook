@@ -510,9 +510,8 @@ pub fn sweep_workload<B: OrderBookApi>() -> Workload<SweepState<B>> {
 // ---------------------------------------------------------------------------
 // `deep_book` — large book with a realistic power-law (Pareto-like) depth
 // profile: liquidity is densest at the mid and thins with distance. Built to
-// stress the regime v2's per-side slab targets — deep same-side chains whose
-// working set exceeds L1, walked while the *shared* slab (v1) has them
-// interleaved with the opposite side.
+// stress the per-side slab: deep same-side chains whose working set
+// exceeds L1.
 //
 // Shape: per side, `DEEP_LEVELS` price levels; level `d` (d ticks off mid)
 // holds `orders(d) = max(1, round(PEAK / d^ALPHA))` orders of qty 1. Liquidity
@@ -768,12 +767,10 @@ pub fn run_warm<S>(w: &Workload<S>, iters: u64) -> std::time::Duration {
 #[allow(dead_code, unused_imports)]
 mod tests {
     use super::*;
-    use calvera_books::orderbooks::orderbook_legacy::{OrderBook as OB1, VecConsumer as Vc1};
-    use calvera_books::orderbooks::orderbook_2::{OrderBook as OB2, VecConsumer as Vc2};
+    use calvera_books::orderbook::{OrderBook, VecConsumer};
 
-    /// Same op stream applied to both variants must run without panicking,
-    /// and the handle map must end with the expected number of resting
-    /// orders. Proves the workload + Harness drive both engines.
+    type Book = OrderBook<VecConsumer>;
+
     fn drive<B: OrderBookApi>(populate: &[Op], mixed: &[Op]) -> usize {
         let mut h = Harness::<B>::new(1 << 14);
         h.apply_all(populate);
@@ -782,44 +779,29 @@ mod tests {
     }
 
     #[test]
-    fn populate_then_mixed_drives_both_variants() {
+    fn populate_then_mixed_drives_the_book() {
         let populate = populate_uniform_ops(20, 2, 10_000, 1);
         let mixed = mixed_workload_ops(0xC0FFEE, 1024, 10_000, 50, 0.7, 100_000);
-
-        let n1 = drive::<OB1<Vc1>>(&populate, &mixed);
-        let n2 = drive::<OB2<Vc2>>(&populate, &mixed);
-
-        // Same op stream → same set of orders rests on both engines.
-        assert_eq!(
-            n1, n2,
-            "v1 and v2 should hold the same number of resting orders after the same stream"
-        );
-        // Sanity: some orders are resting.
-        assert!(n1 > 0);
+        let n = drive::<Book>(&populate, &mixed);
+        assert!(n > 0);
     }
 
     #[test]
-    fn warm_mixed_runs_steady_state_on_both_variants() {
-        // 100k op iters * 2 variants — exceeds the slab cap many times over;
+    fn warm_mixed_runs_steady_state() {
+        // 100k op iters — exceeds the slab cap many times over;
         // would `SlabFull` if the workload weren't steady-state.
-        let d1 = run_warm(&mixed_workload::<OB1<Vc1>>(), 100_000);
-        let d2 = run_warm(&mixed_workload::<OB2<Vc2>>(), 100_000);
-        // Sanity only — perf isn't being tested here, just survival.
-        assert!(d1 > std::time::Duration::ZERO);
-        assert!(d2 > std::time::Duration::ZERO);
+        let d = run_warm(&mixed_workload::<Book>(), 100_000);
+        assert!(d > std::time::Duration::ZERO);
     }
 
     #[test]
-    fn warm_matching_workloads_survive_both_variants() {
+    fn warm_matching_workloads_survive() {
         // Destructive-matching workloads: many iters must not exhaust the slab
         // (match_single is depth-bounded; sweep refills every SWEEP_STRIPS).
-        // 500k iters * 2 variants each — a SlabFull or bad steady-state would
-        // panic well before the end.
+        // 500k iters — a SlabFull or bad steady-state would panic.
         for iters in [500_000u64] {
-            let _ = run_warm(&match_single_workload::<OB1<Vc1>>(), iters);
-            let _ = run_warm(&match_single_workload::<OB2<Vc2>>(), iters);
-            let _ = run_warm(&sweep_workload::<OB1<Vc1>>(), iters);
-            let _ = run_warm(&sweep_workload::<OB2<Vc2>>(), iters);
+            let _ = run_warm(&match_single_workload::<Book>(), iters);
+            let _ = run_warm(&sweep_workload::<Book>(), iters);
         }
     }
 
@@ -844,10 +826,9 @@ mod tests {
             pct >= 75.0,
             "near band should hold ~80% of a side's liquidity, got {pct:.0}%"
         );
-        // Survival on both variants (each iter is heavy; 200 iters is plenty
-        // to prove steady state — a leak or SlabFull would panic).
-        let _ = run_warm(&deep_book_workload::<OB1<Vc1>>(), 200);
-        let _ = run_warm(&deep_book_workload::<OB2<Vc2>>(), 200);
+        // Survival (each iter is heavy; 200 iters is plenty to prove
+        // steady state — a leak or SlabFull would panic).
+        let _ = run_warm(&deep_book_workload::<Book>(), 200);
     }
 
     #[test]
@@ -863,17 +844,13 @@ mod tests {
     }
 
     #[test]
-    fn scenario_workloads_run_both_variants() {
-        // Each scenario replayed 50k iters (>> stream length, so it wraps many
-        // times) on both variants. A leak or bad steady state would SlabFull.
-        let _ = run_warm(&calm_market_workload::<OB1<Vc1>>(), 50_000);
-        let _ = run_warm(&calm_market_workload::<OB2<Vc2>>(), 50_000);
-        let _ = run_warm(&news_event_workload::<OB1<Vc1>>(), 50_000);
-        let _ = run_warm(&news_event_workload::<OB2<Vc2>>(), 50_000);
-        let _ = run_warm(&illiquid_workload::<OB1<Vc1>>(), 50_000);
-        let _ = run_warm(&illiquid_workload::<OB2<Vc2>>(), 50_000);
-        let _ = run_warm(&opening_auction_workload::<OB1<Vc1>>(), 50_000);
-        let _ = run_warm(&opening_auction_workload::<OB2<Vc2>>(), 50_000);
+    fn scenario_workloads_run() {
+        // Each scenario replayed 50k iters (>> stream length, so it wraps).
+        // A leak or bad steady state would SlabFull.
+        let _ = run_warm(&calm_market_workload::<Book>(), 50_000);
+        let _ = run_warm(&news_event_workload::<Book>(), 50_000);
+        let _ = run_warm(&illiquid_workload::<Book>(), 50_000);
+        let _ = run_warm(&opening_auction_workload::<Book>(), 50_000);
     }
 
     #[test]

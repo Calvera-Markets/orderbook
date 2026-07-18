@@ -1,11 +1,5 @@
-//! Shared, variant-agnostic parity suite (M2.5).
-//!
-//! Both `orderbook_legacy` (v1) and `orderbook_2` (v2) implement `OrderBookApi` with
-//! identical behaviour, so the behavioural/stress scenarios that used to be
-//! copy-pasted between `parity.rs` and `parity_2.rs` (~1230 near-identical
-//! lines each) now live here **once**, generic over `B: ParityBook`. The
-//! `tests/parity.rs` entry point stamps out a `#[test]` per scenario for each
-//! variant via the `parity_suite!` macro.
+//! Shared parity suite. Scenarios live here once, generic over `B: ParityBook`.
+//! `tests/parity.rs` stamps out a `#[test]` per scenario.
 //!
 //! The harness maintains a `logical_id → engine handle` map (and its reverse)
 //! so tests can refer to orders by the short, hand-written IDs they pass in
@@ -49,25 +43,7 @@ pub trait FillSource: OrderBookApi {
     fn clear_fills(&mut self);
 }
 
-impl FillSource for calvera_books::orderbooks::orderbook_legacy::OrderBook<calvera_books::orderbooks::orderbook_legacy::VecConsumer> {
-    fn fill_snapshot(&self) -> Vec<(Self::Handle, u64)> {
-        self.consumer
-            .fills
-            .iter()
-            .map(|f| (f.resting_id, f.quantity))
-            .collect()
-    }
-    fn fill_count(&self) -> usize {
-        self.consumer.fills.len()
-    }
-    fn clear_fills(&mut self) {
-        self.consumer.fills.clear();
-    }
-}
-
-impl FillSource
-    for calvera_books::orderbooks::orderbook_2::OrderBook<calvera_books::orderbooks::orderbook_2::VecConsumer>
-{
+impl FillSource for calvera_books::orderbook::OrderBook<calvera_books::orderbook::VecConsumer> {
     fn fill_snapshot(&self) -> Vec<(Self::Handle, u64)> {
         self.consumer
             .fills
@@ -84,8 +60,8 @@ impl FillSource
 }
 
 /// Convenience alias: a book the parity suite can drive. Adds the `Eq + Hash`
-/// bound the reverse handle map needs (both variants' `OrderHandle` derive
-/// them) on top of `FillSource`, so scenario functions can just write
+/// bound the reverse handle map needs (`OrderHandle` derives them) on
+/// top of `FillSource`, so scenario functions can just write
 /// `<B: ParityBook>`.
 pub trait ParityBook: FillSource
 where
