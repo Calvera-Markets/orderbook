@@ -1,6 +1,6 @@
 # calvera-books — Changelog
 
-## Unreleased — parameterized benchmark framework
+## v0.1.0 — parameterized benchmark framework
 
 **Change.** Replaced the copy-paste-per-variant bench harness with a runner
 parameterized over the `OrderBook` implementation, and added warm, steady-state
