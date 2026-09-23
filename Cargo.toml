@@ -10,13 +10,14 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.8.2"
-rand = { workspace = true }
+# `std_rng` for `StdRng`, `small_rng` for the disruptor bench's `SmallRng`.
+rand = { version = "0.9", features = ["std", "std_rng", "small_rng"] }
 # Pinned-algorithm ChaCha RNG for the scenario layer — byte-stable event
 # streams across rand releases, compiler upgrades, and target archs (StdRng's
 # algorithm is not a stability guarantee). Already in the lockfile via `rand`.
 rand_chacha = "0.9"
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 calvera = { git = "https://github.com/kaizu-xyz/calvera.git", branch = "main" }
 # MBO tapes. Default features include zstd (needed for `.dbn.zst`).
 dbn = "0.66"
