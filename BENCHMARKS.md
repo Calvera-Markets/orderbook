@@ -45,6 +45,8 @@ Each figure is the **mean of the medians of three runs**.
 | `mixed`           |  6.29 ns | one add *or* cancel (50/50), populated book        |
 | `add_cancel`      | 11.02 ns | one add *or* cancel, alternating (book holds 0–1)  |
 | `cancel_heavy`    |  9.82 ns | add-tail + cancel-head on a 50-deep single level   |
+| `cancel_in_place` |  4.41 ns | one mid-queue cancel; the level stays               |
+| `place`           |  6.74 ns | one add onto an existing level (no new price)       |
 | `match_single`    | 21.51 ns | add-tail + full-consume match-head at one level    |
 | `add_spread`      | 48.24 ns | add + cancel, each creating/draining a level (BTreeSet) |
 | `sweep` *(noisy)* | 388.9 ns | one market order draining 8 levels (~50 ns/level)  |
@@ -71,6 +73,19 @@ realistic event streams. Definitions live in `workloads.rs` /`scenarios.rs`
 - **`cancel_heavy`** — 50 orders pre-rested at one price; each iter appends at
   the tail and cancels the head. The level never drains, so this isolates the
   per-level FIFO unlink + slab reclaim (no BTreeSet churn).
+- **`cancel_in_place`** — head and tail sentinels rest at one price for the
+  whole run. Each timed iter cancels one order that sits between them, so both
+  neighbors exist and the level never drains. Replenishing the next batch
+  (lift the tail, append the victims, put the tail back) happens before the
+  clock. This is handle decode, the generation check, the prev/next stitch,
+  and the freelist return: the cancel a market maker does against a live level.
+- **`place`** — one sentinel bid keeps a level open for the whole run. Each
+  timed iter joins that level at the tail. The other side is empty, so the
+  match scan misses on the first best-price check, and the price is not a new
+  best, so the BTreeSet stays out of the timed path. Cancelling the burst
+  back onto the freelist happens before the clock. A high tail inside a run
+  pulls Criterion's printed slope up to about 7.3 ns; the table quotes the
+  median, same as every other row.
 - **`match_single`** — 16 asks pre-rested at one price; each iter adds one at the
   tail then crosses the head with a qty-1 bid (full consume). Add-before-consume
   keeps the level from draining, isolating the aggressor's full-consume match
@@ -133,7 +148,7 @@ in a pinned `(params, seed)` and byte-stable via `rand_chacha`.
   huge-page variants are Linux-only; on macOS they skip with a notice. The
   cross-platform page-fault comparison is pending a Linux host.
 - **Run-to-run noise (observed over 3 runs).** The sub-15 ns micro-workloads
-  (`mixed`, `add_cancel`, `cancel_heavy`) drift ~1–5%; the ~20–35 ns workloads
+  (`mixed`, `add_cancel`, `cancel_heavy`, `cancel_in_place`, `place`) drift ~1–5%; the ~20–35 ns workloads
   (`match_single`, scenarios) ~2–7%; `sweep` is the outlier at ~3–13% because of
   its every-64-iters refill burst. The table above averages three runs to damp
   this. On a quiet, pinned machine the spreads would be tighter.

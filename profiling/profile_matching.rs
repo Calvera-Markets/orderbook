@@ -15,8 +15,9 @@ use calvera_books::types::SlabAllocator;
 
 use workloads::{
     Workload, add_cancel_workload, add_spread_workload, calm_market_workload,
-    cancel_heavy_workload, deep_book_workload, illiquid_workload, match_single_workload,
-    mixed_workload, news_event_workload, opening_auction_workload, sweep_workload,
+    cancel_heavy_workload, cancel_in_place_workload, deep_book_workload, illiquid_workload,
+    match_single_workload, mixed_workload, news_event_workload, opening_auction_workload,
+    place_workload, sweep_workload,
 };
 
 /// Only check the deadline every 4096 iters. Without this, `Instant::now()`
@@ -29,7 +30,7 @@ fn usage() -> ! {
     eprintln!("usage: profile_matching <workload> [seconds]");
     eprintln!();
     eprintln!(
-        "  workloads: mixed | add_cancel | add_spread | cancel_heavy | match_single | sweep | deep_book"
+        "  workloads: mixed | add_cancel | add_spread | cancel_heavy | cancel_in_place | place | match_single | sweep | deep_book"
     );
     eprintln!("             | calm_market | news_event | illiquid | opening_auction");
     eprintln!("  seconds:   default 20");
@@ -39,19 +40,48 @@ fn usage() -> ! {
 fn run<S>(w: Workload<S>, deadline: Instant) {
     let mut state = (w.setup)(w.slab_cap, SlabAllocator::System)
         .expect("SlabAllocator::System never fails");
-    for _ in 0..w.warmup_iters {
-        (w.hot)(&mut state);
+    let hot = w.hot;
+    let prepare = w.prepare;
+    let prepare_batch = w.prepare_batch;
+
+    if let Some(prepare) = prepare {
+        let mut left = w.warmup_iters as u64;
+        while left > 0 {
+            let n = left.min(prepare_batch);
+            prepare(&mut state, n);
+            for _ in 0..n {
+                hot(&mut state);
+            }
+            left -= n;
+        }
+    } else {
+        for _ in 0..w.warmup_iters {
+            hot(&mut state);
+        }
     }
 
     let start = Instant::now();
     let mut ops: u64 = 0;
     let mut tick: u64 = 0;
+    // Victims left in the current untimed refill. Zero forces a refill before
+    // the next `hot`, including the first one after warmup.
+    let mut left_in_batch = 0u64;
     loop {
         tick = tick.wrapping_add(1);
         if (tick & POLL_MASK) == 0 && Instant::now() > deadline {
             break;
         }
-        (w.hot)(&mut state);
+        // The criterion bench times `hot` only. Here the refill stays in the
+        // process-wide timer so the flamegraph shows it; it must still run
+        // before `hot` walks off the end of the victim batch.
+        if let Some(prepare) = prepare {
+            if left_in_batch == 0 {
+                prepare(&mut state, prepare_batch);
+                left_in_batch = prepare_batch;
+            }
+            left_in_batch -= 1;
+        }
+        hot(&mut state);
         ops += 1;
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -78,6 +108,8 @@ fn main() {
         "add_cancel" => run(add_cancel_workload::<Book>(), deadline),
         "add_spread" => run(add_spread_workload::<Book>(), deadline),
         "cancel_heavy" => run(cancel_heavy_workload::<Book>(), deadline),
+        "cancel_in_place" => run(cancel_in_place_workload::<Book>(), deadline),
+        "place" => run(place_workload::<Book>(), deadline),
         "match_single" => run(match_single_workload::<Book>(), deadline),
         "sweep" => run(sweep_workload::<Book>(), deadline),
         "deep_book" => run(deep_book_workload::<Book>(), deadline),

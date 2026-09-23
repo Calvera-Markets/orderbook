@@ -183,6 +183,13 @@ pub struct Workload<S> {
     /// at runtime (e.g. empty hugepage pool).
     pub setup: fn(usize, SlabAllocator) -> BookResult<S>,
     pub hot: fn(&mut S),
+    /// Called with a batch count before each burst of that many `hot` calls.
+    /// The runner leaves this call outside the clock, so a workload can rest
+    /// the orders it is about to cancel without the resting landing in the
+    /// measurement. `None` when `hot` is already a steady loop.
+    pub prepare: Option<fn(&mut S, u64)>,
+    /// Upper bound on one `prepare` burst. Ignored when `prepare` is `None`.
+    pub prepare_batch: u64,
 }
 
 /// Per-iter state for the mixed add/cancel workload.
@@ -262,6 +269,8 @@ pub fn add_cancel_workload<B: OrderBookApi>() -> Workload<AddCancelState<B>> {
         warmup_iters: 1_000,
         setup: setup_add_cancel::<B>,
         hot: hot_add_cancel::<B>,
+        prepare: None,
+        prepare_batch: 0,
     }
 }
 
@@ -328,6 +337,8 @@ pub fn add_spread_workload<B: OrderBookApi>() -> Workload<AddSpreadState<B>> {
         warmup_iters: 1_000,
         setup: setup_add_spread::<B>,
         hot: hot_add_spread::<B>,
+        prepare: None,
+        prepare_batch: 0,
     }
 }
 
@@ -381,6 +392,168 @@ pub fn cancel_heavy_workload<B: OrderBookApi>() -> Workload<CancelHeavyState<B>>
         warmup_iters: 1_000,
         setup: setup_cancel_heavy::<B>,
         hot: hot_cancel_heavy::<B>,
+        prepare: None,
+        prepare_batch: 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `cancel_in_place` — one mid-queue cancel. The level stays.
+//
+// Two sentinel orders (head and tail) rest at one price for the whole run.
+// Before each timed burst the runner calls `prepare` (untimed): it lifts the
+// tail, appends a batch of victim orders, then puts the tail back. Every
+// victim therefore has both a predecessor and a successor. `hot` cancels
+// exactly one victim. The level never empties, so the price index and the
+// best-price cache stay out of the timed path. What is measured is handle
+// decode, the generation check, the prev/next stitch, and the freelist return.
+// ---------------------------------------------------------------------------
+
+// Large enough that one timed burst is tens of microseconds. A short burst
+// would quantise to the `Instant` tick (~40 ns on this host) and move the
+// per-cancel figure by a nanosecond or two.
+const CANCEL_IN_PLACE_BATCH: u64 = 4096;
+const CANCEL_IN_PLACE_PRICE: u64 = 100;
+
+pub struct CancelInPlaceState<B: OrderBookApi> {
+    pub book: B,
+    /// Permanent front of the level. Never cancelled by `hot`. The smoke test
+    /// reads it to prove the sentinel outlived the batch.
+    #[allow(dead_code)]
+    pub head: B::Handle,
+    pub tail: B::Handle,
+    pub victims: Vec<B::Handle>,
+    pub cursor: usize,
+}
+
+pub fn setup_cancel_in_place<B: OrderBookApi>(
+    slab_cap: usize,
+    alloc: SlabAllocator,
+) -> BookResult<CancelInPlaceState<B>> {
+    let mut book = B::new_with_alloc(slab_cap, alloc)?;
+    let head = book
+        .add_limit(Side::Bid, Price(CANCEL_IN_PLACE_PRICE), 1)?
+        .expect("head sentinel rests");
+    let tail = book
+        .add_limit(Side::Bid, Price(CANCEL_IN_PLACE_PRICE), 1)?
+        .expect("tail sentinel rests");
+    Ok(CancelInPlaceState {
+        book,
+        head,
+        tail,
+        victims: Vec::with_capacity(CANCEL_IN_PLACE_BATCH as usize),
+        cursor: 0,
+    })
+}
+
+/// Rest `n` mid-queue orders between the permanent head and a fresh tail.
+/// Untimed. `n` is the number of `hot` calls that follow.
+pub fn prepare_cancel_in_place<B: OrderBookApi>(s: &mut CancelInPlaceState<B>, n: u64) {
+    s.book.cancel(s.tail).expect("tail sentinel still resting");
+    s.victims.clear();
+    for _ in 0..n {
+        let h = s
+            .book
+            .add_limit(Side::Bid, Price(CANCEL_IN_PLACE_PRICE), 1)
+            .expect("slab has room for the batch")
+            .expect("victim rests");
+        s.victims.push(h);
+    }
+    s.tail = s
+        .book
+        .add_limit(Side::Bid, Price(CANCEL_IN_PLACE_PRICE), 1)
+        .expect("slab has room for the tail")
+        .expect("tail rests");
+    s.cursor = 0;
+}
+
+#[inline]
+pub fn hot_cancel_in_place<B: OrderBookApi>(s: &mut CancelInPlaceState<B>) {
+    let h = s.victims[s.cursor];
+    s.cursor += 1;
+    let _ = s.book.cancel(h);
+}
+
+pub fn cancel_in_place_workload<B: OrderBookApi>() -> Workload<CancelInPlaceState<B>> {
+    Workload {
+        name: "cancel_in_place",
+        // Head + tail + one batch of victims, with room to recycle.
+        slab_cap: 1 << 14,
+        warmup_iters: 1_000,
+        setup: setup_cancel_in_place::<B>,
+        hot: hot_cancel_in_place::<B>,
+        prepare: Some(prepare_cancel_in_place::<B>),
+        prepare_batch: CANCEL_IN_PLACE_BATCH,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `place` — one add onto a level that already exists.
+//
+// A sentinel bid rests at one price for the whole run, so the level and the
+// best price are already installed. Each timed iter joins that level at the
+// tail. The opposite side is empty, so the match scan misses immediately and
+// nothing crosses. The price is not a new best and the level is not new, so
+// the BTreeSet and the best-price store stay out of the timed path. Before
+// the next burst, `prepare` (untimed) cancels what the burst just rested and
+// returns those slots to the freelist.
+// ---------------------------------------------------------------------------
+
+const PLACE_BATCH: u64 = 4096;
+const PLACE_PRICE: u64 = 100;
+
+pub struct PlaceState<B: OrderBookApi> {
+    pub book: B,
+    /// Keeps the level alive. Never cancelled by `hot` or `prepare`.
+    #[allow(dead_code)]
+    pub sentinel: B::Handle,
+    pub placed: Vec<B::Handle>,
+}
+
+pub fn setup_place<B: OrderBookApi>(
+    slab_cap: usize,
+    alloc: SlabAllocator,
+) -> BookResult<PlaceState<B>> {
+    let mut book = B::new_with_alloc(slab_cap, alloc)?;
+    let sentinel = book
+        .add_limit(Side::Bid, Price(PLACE_PRICE), 1)?
+        .expect("sentinel rests");
+    Ok(PlaceState {
+        book,
+        sentinel,
+        placed: Vec::with_capacity(PLACE_BATCH as usize),
+    })
+}
+
+/// Cancel the previous burst. Untimed. The following `n` `hot` calls rest
+/// that many new orders on the sentinel's level.
+pub fn prepare_place<B: OrderBookApi>(s: &mut PlaceState<B>, n: u64) {
+    for h in s.placed.drain(..) {
+        s.book.cancel(h).expect("placed order still resting");
+    }
+    s.placed.reserve(n as usize);
+}
+
+#[inline]
+pub fn hot_place<B: OrderBookApi>(s: &mut PlaceState<B>) {
+    let h = s
+        .book
+        .add_limit(Side::Bid, Price(PLACE_PRICE), 1)
+        .expect("slab has room")
+        .expect("order rests on the open level");
+    s.placed.push(h);
+}
+
+pub fn place_workload<B: OrderBookApi>() -> Workload<PlaceState<B>> {
+    Workload {
+        name: "place",
+        // Sentinel + one batch, with room to recycle through the freelist.
+        slab_cap: 1 << 14,
+        warmup_iters: 1_000,
+        setup: setup_place::<B>,
+        hot: hot_place::<B>,
+        prepare: Some(prepare_place::<B>),
+        prepare_batch: PLACE_BATCH,
     }
 }
 
@@ -431,6 +604,8 @@ pub fn match_single_workload<B: OrderBookApi>() -> Workload<MatchSingleState<B>>
         warmup_iters: 1_000,
         setup: setup_match_single::<B>,
         hot: hot_match_single::<B>,
+        prepare: None,
+        prepare_batch: 0,
     }
 }
 
@@ -504,6 +679,8 @@ pub fn sweep_workload<B: OrderBookApi>() -> Workload<SweepState<B>> {
         warmup_iters: 1_000,
         setup: setup_sweep::<B>,
         hot: hot_sweep::<B>,
+        prepare: None,
+        prepare_batch: 0,
     }
 }
 
@@ -603,6 +780,8 @@ pub fn deep_book_workload<B: OrderBookApi>() -> Workload<DeepBookState<B>> {
         warmup_iters: 20,
         setup: setup_deep_book::<B>,
         hot: hot_deep_book::<B>,
+        prepare: None,
+        prepare_batch: 0,
     }
 }
 
@@ -699,6 +878,8 @@ macro_rules! scenario_workload {
                 warmup_iters: SCENARIO_N_EVENTS,
                 setup: $setup::<B>,
                 hot: hot_scenario::<B>,
+                prepare: None,
+                prepare_batch: 0,
             }
         }
     };
@@ -739,6 +920,8 @@ pub fn mixed_workload<B: OrderBookApi>() -> Workload<MixedState<B>> {
         warmup_iters: 1_000,
         setup: setup_mixed_warm::<B>,
         hot: hot_mixed::<B>,
+        prepare: None,
+        prepare_batch: 0,
     }
 }
 
@@ -749,14 +932,44 @@ pub fn mixed_workload<B: OrderBookApi>() -> Workload<MixedState<B>> {
 pub fn run_warm<S>(w: &Workload<S>, iters: u64) -> std::time::Duration {
     let mut state = (w.setup)(w.slab_cap, SlabAllocator::System)
         .expect("SlabAllocator::System never fails");
-    for _ in 0..w.warmup_iters {
-        (w.hot)(&mut state);
+    let hot = w.hot;
+    match w.prepare {
+        None => {
+            for _ in 0..w.warmup_iters {
+                hot(&mut state);
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                hot(&mut state);
+            }
+            start.elapsed()
+        }
+        Some(prepare) => {
+            let batch = w.prepare_batch;
+            let mut warm = w.warmup_iters as u64;
+            while warm > 0 {
+                let n = warm.min(batch);
+                prepare(&mut state, n);
+                for _ in 0..n {
+                    hot(&mut state);
+                }
+                warm -= n;
+            }
+            let mut total = std::time::Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                let n = left.min(batch);
+                prepare(&mut state, n);
+                let start = std::time::Instant::now();
+                for _ in 0..n {
+                    hot(&mut state);
+                }
+                total += start.elapsed();
+                left -= n;
+            }
+            total
+        }
     }
-    let start = std::time::Instant::now();
-    for _ in 0..iters {
-        (w.hot)(&mut state);
-    }
-    start.elapsed()
 }
 
 #[cfg(test)]
@@ -792,6 +1005,52 @@ mod tests {
         // would `SlabFull` if the workload weren't steady-state.
         let d = run_warm(&mixed_workload::<Book>(), 100_000);
         assert!(d > std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn cancel_in_place_drops_victims_and_keeps_sentinels() {
+        // Victims are retired. Head and tail are still live, so every timed
+        // cancel sat between two orders and the level never drained.
+        let w = cancel_in_place_workload::<Book>();
+        let mut state = (w.setup)(w.slab_cap, SlabAllocator::System).unwrap();
+        let prepare = w.prepare.unwrap();
+        prepare(&mut state, 16);
+        let victims = state.victims.clone();
+        let head = state.head;
+        let tail = state.tail;
+        for _ in 0..16 {
+            (w.hot)(&mut state);
+        }
+        for h in victims {
+            assert!(state.book.cancel(h).is_err(), "victim was still resting");
+        }
+        assert!(state.book.cancel(tail).is_ok(), "tail sentinel retired early");
+        assert!(state.book.cancel(head).is_ok(), "head sentinel retired early");
+
+        // 100k cancels must recycle the batch instead of exhausting the slab.
+        let _ = run_warm(&cancel_in_place_workload::<Book>(), 100_000);
+    }
+
+    #[test]
+    fn place_rests_on_the_open_level_and_survives() {
+        // Each hot call rests behind the sentinel. prepare then retires just
+        // that burst, so a long run recycles slots instead of filling the slab.
+        let w = place_workload::<Book>();
+        let mut state = (w.setup)(w.slab_cap, SlabAllocator::System).unwrap();
+        let prepare = w.prepare.unwrap();
+        let sentinel = state.sentinel;
+        prepare(&mut state, 16);
+        for _ in 0..16 {
+            (w.hot)(&mut state);
+        }
+        let placed = state.placed.clone();
+        assert_eq!(placed.len(), 16);
+        for h in placed {
+            assert!(state.book.cancel(h).is_ok(), "placed order was not resting");
+        }
+        assert!(state.book.cancel(sentinel).is_ok(), "sentinel retired early");
+
+        let _ = run_warm(&place_workload::<Book>(), 100_000);
     }
 
     #[test]

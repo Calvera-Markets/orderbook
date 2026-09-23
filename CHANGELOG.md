@@ -15,7 +15,9 @@ one engine-visible addition is the slab allocator axis).
 - **Shared `workloads.rs`** (outside `src/` — bench/test infra, pulled in via
   `#[path]`): single source of truth for op streams, with a generic `Harness`
   mapping logical ids → engine handles. Warm micro-workloads: `mixed`,
-  `add_cancel`, `add_spread`, `cancel_heavy`, `match_single` (full-consume
+  `add_cancel`, `add_spread`, `cancel_heavy`, `cancel_in_place` (mid-queue
+  cancel; the level stays, and the replenishing adds are untimed), `place`
+  (add onto an open level; the retiring cancels are untimed), `match_single` (full-consume
   match), `sweep` (multi-level market sweep via multi-strip refill), and
   `deep_book` (large power-law/Pareto depth book, ~80% of liquidity near the
   mid; sweeps + rebuilds the near band — the workload that exercises v2's
