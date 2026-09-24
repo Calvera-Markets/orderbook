@@ -1,5 +1,20 @@
 # calvera-books — Changelog
 
+## v0.1.1 — `match_against` returns `u64`
+
+**Change.** The sweep no longer returns a `Result`, and a drained level always
+refreshes the best price. `add_limit_order` and `add_market_order` still return
+`BookResult`.
+
+- **`match_against`** returns the remaining quantity as a `u64`. The function
+  only ever returned `Ok`, so both add paths use that value directly.
+- **Drained level.** `fill_price` is copied from `best_price` at the start of
+  the iteration, and the walk does not change it, so the sweep always calls
+  `update_best_price` after removing the level. Cancel still compares, because
+  a cancel can empty a level that is not the best.
+
+---
+
 ## v0.1.0 — parameterized benchmark framework
 
 **Change.** Replaced the copy-paste-per-variant bench harness with a runner
