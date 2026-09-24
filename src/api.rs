@@ -49,3 +49,65 @@ pub trait OrderBookApi {
     /// Cancel a resting order by its handle.
     fn cancel(&mut self, handle: Self::Handle) -> BookResult<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::OrderBookApi;
+    use crate::errors::BookError;
+    use crate::types::{MarketOrderMode, MarketOrderResult, Price, Side, SlabAllocator};
+
+    /// Keeps the trait's default `new_with_alloc`. `OrderBook` overrides it.
+    struct Fallback;
+
+    impl OrderBookApi for Fallback {
+        type Handle = ();
+
+        fn new(_slab_capacity: usize) -> Self {
+            Fallback
+        }
+
+        fn add_limit(
+            &mut self,
+            _side: Side,
+            _price: Price,
+            _qty: u64,
+        ) -> crate::errors::BookResult<Option<Self::Handle>> {
+            Ok(None)
+        }
+
+        fn add_market(
+            &mut self,
+            _side: Side,
+            _qty: u64,
+            _mode: MarketOrderMode,
+        ) -> crate::errors::BookResult<MarketOrderResult> {
+            Ok(MarketOrderResult { remaining: 0 })
+        }
+
+        fn cancel(&mut self, _handle: Self::Handle) -> crate::errors::BookResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_new_with_alloc_accepts_system_and_rejects_other_allocators() {
+        let mut book = Fallback::new_with_alloc(8, SlabAllocator::System).unwrap();
+        assert_eq!(book.add_limit(Side::Bid, Price(1), 1).unwrap(), None);
+        assert_eq!(
+            book.add_market(Side::Ask, 1, MarketOrderMode::ImmediateOrCancel)
+                .unwrap()
+                .remaining,
+            0
+        );
+        book.cancel(()).unwrap();
+
+        assert!(matches!(
+            Fallback::new_with_alloc(8, SlabAllocator::MadvHugepage),
+            Err(BookError::UnsupportedAllocator)
+        ));
+        assert!(matches!(
+            Fallback::new_with_alloc(8, SlabAllocator::Hugetlb),
+            Err(BookError::UnsupportedAllocator)
+        ));
+    }
+}

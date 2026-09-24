@@ -1111,3 +1111,52 @@ impl<C: FillConsumer + Default> crate::api::OrderBookApi for OrderBook<C> {
         self.cancel_limit_order(handle)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_stops_when_best_price_has_no_level() {
+        let mut book = OrderBook::<VecConsumer>::new(16);
+        book.asks.best_price = Some(Price(100));
+
+        let handle = book
+            .add_limit_order(Side::Bid, Price(100), 5)
+            .unwrap()
+            .expect("bid rests");
+
+        assert!(book.consumer.fills.is_empty());
+        assert_eq!(handle.side(), Side::Bid);
+    }
+
+    #[test]
+    fn sweep_stops_when_level_head_is_empty() {
+        let mut book = OrderBook::<VecConsumer>::new(16);
+        book.asks.best_price = Some(Price(100));
+        book.asks
+            .levels
+            .insert(Price(100), PriceLevel::new(Price(100)));
+
+        let handle = book
+            .add_limit_order(Side::Bid, Price(100), 5)
+            .unwrap()
+            .expect("bid rests");
+
+        assert!(book.consumer.fills.is_empty());
+        assert_eq!(handle.side(), Side::Bid);
+    }
+
+    #[test]
+    fn cancel_ignores_a_slot_whose_level_is_gone() {
+        let mut book = OrderBook::<VecConsumer>::new(16);
+        let handle = book
+            .add_limit_order(Side::Bid, Price(100), 1)
+            .unwrap()
+            .expect("bid rests");
+        let price = book.bids.slab.get(handle.idx()).price;
+        assert!(book.bids.levels.remove(&price).is_some());
+
+        assert!(book.cancel_limit_order(handle).is_ok());
+    }
+}

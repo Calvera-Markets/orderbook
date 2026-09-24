@@ -37,3 +37,16 @@ impl Hasher for U64Mixer {
         self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::U64Mixer;
+    use std::hash::Hasher;
+
+    #[test]
+    #[should_panic(expected = "U64Mixer is u64-only")]
+    fn write_panics_because_keys_are_single_u64() {
+        let mut mixer = U64Mixer::default();
+        mixer.write(&[0]);
+    }
+}

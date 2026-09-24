@@ -38,6 +38,10 @@ alias t := test
 test *FLAGS:
     cargo test {{FLAGS}}
 
+# Reports test coverage. Requires cargo-llvm-cov.
+coverage *FLAGS:
+    cargo llvm-cov {{FLAGS}}
+
 # ---------------------------------------------------------------------------
 # Benchmarks (criterion — see BENCHMARKS.md)
 # ---------------------------------------------------------------------------
