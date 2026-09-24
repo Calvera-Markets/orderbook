@@ -101,7 +101,7 @@ impl<C: FillConsumer> OrderBook<C> {
         &mut self,
         price_limit: Option<Price>,
         quantity: u64,
-    ) -> BookResult<u64> {
+    ) -> u64 {
         let mut remaining = quantity;
         let mut freed_chain_head: Option<SlabIndex> = None;
         let mut freed_chain_tail: Option<SlabIndex> = None;
@@ -290,7 +290,7 @@ impl<C: FillConsumer> OrderBook<C> {
             opposite.slab.free_head = Some(head);
         }
 
-        Ok(remaining)
+        remaining
     }
 
     // (1) Match against the opposite side up to `price`
@@ -308,8 +308,8 @@ impl<C: FillConsumer> OrderBook<C> {
         // Dispatch once on aggressor side and select the matcher
         // monomorph that has the opposite side baked in.
         let remaining = match side {
-            Side::Bid => self.match_against::<true>(Some(price), quantity)?,
-            Side::Ask => self.match_against::<false>(Some(price), quantity)?,
+            Side::Bid => self.match_against::<true>(Some(price), quantity),
+            Side::Ask => self.match_against::<false>(Some(price), quantity),
         };
 
         // Dispatch on side at the call site so each arm operates on a
@@ -416,8 +416,8 @@ impl<C: FillConsumer> OrderBook<C> {
         // Market = sweep unconditionally → price_limit = None.
         // Same per-side dispatch pattern as add_limit_order.
         let remaining = match side {
-            Side::Bid => self.match_against::<true>(None, quantity)?,
-            Side::Ask => self.match_against::<false>(None, quantity)?,
+            Side::Bid => self.match_against::<true>(None, quantity),
+            Side::Ask => self.match_against::<false>(None, quantity),
         };
 
         self.consumer.flush();
