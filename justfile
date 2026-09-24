@@ -38,9 +38,11 @@ alias t := test
 test *FLAGS:
     cargo test {{FLAGS}}
 
-# Reports test coverage. Requires cargo-llvm-cov.
+# Reports test coverage and writes badges/coverage.svg. Requires cargo-llvm-cov.
 coverage *FLAGS:
     cargo llvm-cov {{FLAGS}}
+    cargo llvm-cov report --json --summary-only --output-path target/coverage-summary.json
+    python3 scripts/coverage_badge.py target/coverage-summary.json badges/coverage.svg
 
 # ---------------------------------------------------------------------------
 # Benchmarks (criterion — see BENCHMARKS.md)
