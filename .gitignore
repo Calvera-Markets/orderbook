@@ -1,4 +1,5 @@
 /target
+lcov.info
 .DS_Store
 .env
 *.pem

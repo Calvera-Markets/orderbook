@@ -31,13 +31,23 @@ jobs:
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy,llvm-tools-preview
 
       - uses: extractions/setup-just@v4
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
       - run: just lint
       - run: just clippy
       - run: just doc-check
       - run: just test
+      - run: just coverage --lcov --output-path lcov.info
+
+      - uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}

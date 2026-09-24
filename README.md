@@ -1,6 +1,7 @@
 # Calvera Orderbook
 
 [![CI](https://github.com/Calvera-Markets/orderbook/actions/workflows/ci.yml/badge.svg)](https://github.com/Calvera-Markets/orderbook/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Calvera-Markets/orderbook/graph/badge.svg)](https://codecov.io/gh/Calvera-Markets/orderbook)
 
            ██████╗ █████╗ ██╗    ██╗   ██╗███████╗██████╗  █████╗ 
           ██╔════╝██╔══██╗██║    ██║   ██║██╔════╝██╔══██╗██╔══██╗
