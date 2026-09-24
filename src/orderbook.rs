@@ -274,9 +274,10 @@ impl<C: FillConsumer> OrderBook<C> {
             if level_drained {
                 opposite.levels.remove(&fill_price);
                 opposite.price_index.remove(&fill_price);
-                if opposite.best_price == Some(fill_price) {
-                    opposite.update_best_price();
-                }
+                //    `fill_price` was read from `best_price` at the top of this
+                //    iteration, and the walk does not touch `best_price`, so the
+                //    drained level is the best.
+                opposite.update_best_price();
             }
         }
 
