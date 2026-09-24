@@ -38,7 +38,7 @@
                 ░░░░░░░░░░░░░░░    ║ D ║     ████████████████
 
 
-A ultra-low latency central-limit order book with 6.74 ns to place on an open level, 4.41 ns to cancel in place. Price-time FIFO, integer ticks. This crate export purely the core structure and its matching logic. It is not a full macthing engine server: no sockets, no OUCH/ITCH, no WAL. Fills go through a `FillConsumer` binded at the type level so the call inlines.
+A ultra-low latency central-limit order book with **6.74 ns to place** on an open level, **4.41 ns to cancel** in place. Price-time FIFO, integer ticks. This crate export purely the core structure and its matching logic. It is not a full macthing engine server: no sockets, no OUCH/ITCH, no WAL. Fills go through a `FillConsumer` binded at the type level so the call inlines.
 
 ```rust
 use calvera_books::{OrderBook, Price, Side, VecConsumer};
