@@ -115,7 +115,10 @@ fn id_from_dir(dir_name: &str) -> String {
 fn collect_records(criterion_dir: &Path) -> Vec<Record> {
     let mut records = Vec::new();
     let Ok(entries) = fs::read_dir(criterion_dir) else {
-        eprintln!("warning: {} not found — run `cargo bench --bench engine` first", criterion_dir.display());
+        eprintln!(
+            "warning: {} not found — run `cargo bench --bench engine` first",
+            criterion_dir.display()
+        );
         return records;
     };
     for entry in entries.flatten() {
@@ -158,7 +161,11 @@ fn write_csv(records: &[Record], path: &Path) -> std::io::Result<()> {
     let mut f = fs::File::create(path)?;
     writeln!(f, "id,median_ns,low_ns,high_ns")?;
     for r in records {
-        writeln!(f, "{},{:.3},{:.3},{:.3}", r.id, r.median_ns, r.low_ns, r.high_ns)?;
+        writeln!(
+            f,
+            "{},{:.3},{:.3},{:.3}",
+            r.id, r.median_ns, r.low_ns, r.high_ns
+        )?;
     }
     Ok(())
 }
@@ -176,7 +183,10 @@ fn main() {
 
     let records = collect_records(&criterion_dir);
     if records.is_empty() {
-        eprintln!("no benches found under {} — nothing to report", criterion_dir.display());
+        eprintln!(
+            "no benches found under {} — nothing to report",
+            criterion_dir.display()
+        );
         std::process::exit(1);
     }
 
@@ -195,14 +205,23 @@ fn main() {
     let json_path = logs_dir.join(format!("results-{}.json", report.timestamp));
     let csv_path = logs_dir.join(format!("results-{}.csv", report.timestamp));
 
-    fs::write(&json_path, serde_json::to_string_pretty(&report).expect("serialize json"))
-        .expect("write json");
+    fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&report).expect("serialize json"),
+    )
+    .expect("write json");
     write_csv(&report.results, &csv_path).expect("write csv");
 
-    println!("→ host: {} / {} ({})", report.host.os, report.host.arch, report.host.family);
+    println!(
+        "→ host: {} / {} ({})",
+        report.host.os, report.host.arch, report.host.family
+    );
     println!("→ {} results", report.results.len());
     for r in &report.results {
-        println!("  {:32} median={:>7.2} ns  ci=[{:>6.2}, {:>6.2}]", r.id, r.median_ns, r.low_ns, r.high_ns);
+        println!(
+            "  {:32} median={:>7.2} ns  ci=[{:>6.2}, {:>6.2}]",
+            r.id, r.median_ns, r.low_ns, r.high_ns
+        );
     }
     println!("→ json: {}", json_path.display());
     println!("→ csv:  {}", csv_path.display());

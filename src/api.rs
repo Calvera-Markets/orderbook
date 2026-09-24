@@ -5,7 +5,7 @@
 //! hand it back to `cancel`.
 
 use crate::errors::BookResult;
-use crate::types::{MarketOrderMode, MarketOrderResult, Price, SlabAllocator, Side};
+use crate::types::{MarketOrderMode, MarketOrderResult, Price, Side, SlabAllocator};
 
 pub trait OrderBookApi {
     /// Engine-minted, opaque order handle. The encoding stays private to the

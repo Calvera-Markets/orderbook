@@ -29,12 +29,23 @@ use scenarios::{Event, Scenario};
 /// A single market-affecting action. `id`s are workload-local.
 #[derive(Debug, Clone, Copy)]
 pub enum Op {
-    Limit { id: u64, side: Side, price: Price, qty: u64 },
-    Cancel { id: u64 },
+    Limit {
+        id: u64,
+        side: Side,
+        price: Price,
+        qty: u64,
+    },
+    Cancel {
+        id: u64,
+    },
     /// Market orders never rest. Currently unused by the warm `mixed`
     /// workload (it's add+cancel only); M6 scenarios will emit these.
     #[allow(dead_code)]
-    Market { side: Side, qty: u64, mode: MarketOrderMode },
+    Market {
+        side: Side,
+        qty: u64,
+        mode: MarketOrderMode,
+    },
 }
 
 /// Drives an op stream against any `B: OrderBookApi`, mapping logical ids to
@@ -51,7 +62,10 @@ impl<B: OrderBookApi> Harness<B> {
     /// `SlabAllocator` choice.
     #[allow(dead_code)]
     pub fn new(slab_capacity: usize) -> Self {
-        Self { book: B::new(slab_capacity), handles: HashMap::new() }
+        Self {
+            book: B::new(slab_capacity),
+            handles: HashMap::new(),
+        }
     }
 
     /// Build a harness whose book is constructed with the given allocator.
@@ -67,7 +81,12 @@ impl<B: OrderBookApi> Harness<B> {
     #[inline]
     pub fn apply(&mut self, op: &Op) {
         match *op {
-            Op::Limit { id, side, price, qty } => {
+            Op::Limit {
+                id,
+                side,
+                price,
+                qty,
+            } => {
                 if let Ok(Some(h)) = self.book.add_limit(side, price, qty) {
                     self.handles.insert(id, h);
                 }
@@ -109,11 +128,21 @@ pub fn populate_uniform_ops(
     let mut id = start_id;
     for i in 1..=levels {
         for _ in 0..orders_per_level {
-            ops.push(Op::Limit { id, side: Side::Bid, price: Price(mid - i), qty: 1 });
+            ops.push(Op::Limit {
+                id,
+                side: Side::Bid,
+                price: Price(mid - i),
+                qty: 1,
+            });
             id += 1;
         }
         for _ in 0..orders_per_level {
-            ops.push(Op::Limit { id, side: Side::Ask, price: Price(mid + i), qty: 1 });
+            ops.push(Op::Limit {
+                id,
+                side: Side::Ask,
+                price: Price(mid + i),
+                qty: 1,
+            });
             id += 1;
         }
     }
@@ -144,13 +173,22 @@ pub fn mixed_workload_ops(
         let do_add = next_id == start_id || rng.random_bool(add_ratio);
         if do_add {
             next_id += 1;
-            let side = if rng.random_bool(0.5) { Side::Bid } else { Side::Ask };
+            let side = if rng.random_bool(0.5) {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
             let offset = rng.random_range(1..=spread_ticks);
             let price = match side {
                 Side::Bid => Price(mid - offset),
                 Side::Ask => Price(mid + offset),
             };
-            ops.push(Op::Limit { id: next_id, side, price, qty: 1 });
+            ops.push(Op::Limit {
+                id: next_id,
+                side,
+                price,
+                qty: 1,
+            });
         } else {
             let target = rng.random_range((start_id + 1)..=next_id);
             ops.push(Op::Cancel { id: target });
@@ -212,7 +250,11 @@ pub fn setup_mixed_warm<B: OrderBookApi>(
     harness.apply_all(&populate);
     // 50/50 add:cancel — net-zero growth in own-issued orders.
     let ops = mixed_workload_ops(0xC0FFEE, 1024, 10_000, 50, 0.5, 100_000);
-    Ok(MixedState { harness, ops, idx: 0 })
+    Ok(MixedState {
+        harness,
+        ops,
+        idx: 0,
+    })
 }
 
 /// One op per call; cursor wraps around the precomputed ops vec so the
@@ -243,7 +285,10 @@ pub fn setup_add_cancel<B: OrderBookApi>(
     slab_cap: usize,
     alloc: SlabAllocator,
 ) -> BookResult<AddCancelState<B>> {
-    Ok(AddCancelState { book: B::new_with_alloc(slab_cap, alloc)?, resting: None })
+    Ok(AddCancelState {
+        book: B::new_with_alloc(slab_cap, alloc)?,
+        resting: None,
+    })
 }
 
 #[inline]
@@ -930,8 +975,8 @@ pub fn mixed_workload<B: OrderBookApi>() -> Workload<MixedState<B>> {
 /// workload smoke tests; the real criterion runner is `benches/engine.rs`.
 #[allow(dead_code)]
 pub fn run_warm<S>(w: &Workload<S>, iters: u64) -> std::time::Duration {
-    let mut state = (w.setup)(w.slab_cap, SlabAllocator::System)
-        .expect("SlabAllocator::System never fails");
+    let mut state =
+        (w.setup)(w.slab_cap, SlabAllocator::System).expect("SlabAllocator::System never fails");
     let hot = w.hot;
     match w.prepare {
         None => {
@@ -1024,8 +1069,14 @@ mod tests {
         for h in victims {
             assert!(state.book.cancel(h).is_err(), "victim was still resting");
         }
-        assert!(state.book.cancel(tail).is_ok(), "tail sentinel retired early");
-        assert!(state.book.cancel(head).is_ok(), "head sentinel retired early");
+        assert!(
+            state.book.cancel(tail).is_ok(),
+            "tail sentinel retired early"
+        );
+        assert!(
+            state.book.cancel(head).is_ok(),
+            "head sentinel retired early"
+        );
 
         // 100k cancels must recycle the batch instead of exhausting the slab.
         let _ = run_warm(&cancel_in_place_workload::<Book>(), 100_000);
@@ -1048,7 +1099,10 @@ mod tests {
         for h in placed {
             assert!(state.book.cancel(h).is_ok(), "placed order was not resting");
         }
-        assert!(state.book.cancel(sentinel).is_ok(), "sentinel retired early");
+        assert!(
+            state.book.cancel(sentinel).is_ok(),
+            "sentinel retired early"
+        );
 
         let _ = run_warm(&place_workload::<Book>(), 100_000);
     }

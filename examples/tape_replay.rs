@@ -81,8 +81,8 @@ impl TapeStats {
 }
 
 fn load_dbn(path: &Path, modify: ModifyMode, limit: Option<usize>) -> (Vec<TapeOp>, TapeStats) {
-    use dbn::decode::{DbnDecoder, DecodeRecordRef};
     use dbn::MboMsg;
+    use dbn::decode::{DbnDecoder, DecodeRecordRef};
 
     let mut decoder = DbnDecoder::from_zstd_file(path).unwrap_or_else(|e| {
         eprintln!("failed to open {}: {e}", path.display());
@@ -197,11 +197,27 @@ fn synthetic_tape(n: usize) -> (Vec<TapeOp>, TapeStats) {
         rng
     };
 
-    let mut push_add = |ops: &mut Vec<TapeOp>, live: &mut Vec<Live>, next_id: &mut u64, side: Side, price: Price, qty: u64| {
+    let mut push_add = |ops: &mut Vec<TapeOp>,
+                        live: &mut Vec<Live>,
+                        next_id: &mut u64,
+                        side: Side,
+                        price: Price,
+                        qty: u64| {
         let id = *next_id;
         *next_id += 1;
-        ops.push(TapeOp { action: Action::Add, id, side, price, qty });
-        live.push(Live { id, side, price, qty });
+        ops.push(TapeOp {
+            action: Action::Add,
+            id,
+            side,
+            price,
+            qty,
+        });
+        live.push(Live {
+            id,
+            side,
+            price,
+            qty,
+        });
         adds += 1;
     };
 
@@ -246,10 +262,20 @@ fn synthetic_tape(n: usize) -> (Vec<TapeOp>, TapeStats) {
             let id = live[idx].id;
             live[idx].price = price;
             live[idx].qty = qty;
-            ops.push(TapeOp { action: Action::Modify, id, side, price, qty });
+            ops.push(TapeOp {
+                action: Action::Modify,
+                id,
+                side,
+                price,
+                qty,
+            });
             modifies += 1;
         } else {
-            let side = if next_u64() % 2 == 0 { Side::Bid } else { Side::Ask };
+            let side = if next_u64() % 2 == 0 {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
             let offset = (next_u64() % SPREAD) + 1;
             let price = match side {
                 Side::Bid => Price(MID - offset),
@@ -621,12 +647,7 @@ fn parse_usize(s: &str, flag: &str) -> usize {
 // Run one impl
 // ---------------------------------------------------------------------------
 
-fn run_impl<B: OrderBookApi>(
-    label: &str,
-    ops: &[TapeOp],
-    cfg: &Config,
-    clock: &ReplayClock,
-) {
+fn run_impl<B: OrderBookApi>(label: &str, ops: &[TapeOp], cfg: &Config, clock: &ReplayClock) {
     println!("\n=== {label} ===");
 
     let mut replay = Replayer::<B>::new(cfg.slab, cfg.alloc);
@@ -779,7 +800,10 @@ fn maybe_pin(cpu: Option<usize>) {
             libc::CPU_SET(cpu, &mut set);
             let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
             if rc != 0 {
-                eprintln!("sched_setaffinity({cpu}) failed: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "sched_setaffinity({cpu}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
             } else {
                 println!("pinned to cpu {cpu}");
             }
@@ -807,7 +831,11 @@ fn main() {
         let path = cfg.tape.as_deref().expect("tape");
         load_dbn(path, cfg.modify, cfg.limit)
     };
-    println!("loaded {} kept ops in {:.2}s", ops.len(), load0.elapsed().as_secs_f64());
+    println!(
+        "loaded {} kept ops in {:.2}s",
+        ops.len(),
+        load0.elapsed().as_secs_f64()
+    );
     println!(
         "tape mix:     add={}  cancel={}  modify={}  skip_side={}  skip_price={}  skip_other={}",
         tape_stats.adds,

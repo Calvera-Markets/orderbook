@@ -30,9 +30,7 @@ use calvera::{BusySpin, Producer, UniConsumerBarrier, UniProducer, build_uni_pro
 use calvera_books::orderbook::{
     Fill, FillConsumer, MarketOrderMode, OrderBook, OrderHandle, Price, Side,
 };
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 const SLAB_CAP: usize = 1 << 20; // 1,048,576

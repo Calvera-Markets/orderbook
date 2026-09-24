@@ -38,8 +38,8 @@ fn usage() -> ! {
 }
 
 fn run<S>(w: Workload<S>, deadline: Instant) {
-    let mut state = (w.setup)(w.slab_cap, SlabAllocator::System)
-        .expect("SlabAllocator::System never fails");
+    let mut state =
+        (w.setup)(w.slab_cap, SlabAllocator::System).expect("SlabAllocator::System never fails");
     let hot = w.hot;
     let prepare = w.prepare;
     let prepare_batch = w.prepare_batch;
