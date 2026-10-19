@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
 
 use crate::errors::{BookError, BookResult};
+use crate::gate::{Admit, GatedOutcome, MakerRef, MatchGate, OpenGate};
 use crate::u64_map::U64Map;
 
 pub use crate::types::{MarketOrderMode, MarketOrderResult, Price, Side, SlabAllocator};
@@ -97,12 +98,14 @@ impl<C: FillConsumer> OrderBook<C> {
     /// stayed alive across the whole inlined body. See
     /// `ideas/per_side_slab_result.md` for the asm analysis.
     #[inline(always)]
-    fn match_against<const OPP_IS_ASK: bool>(
+    fn match_against<const OPP_IS_ASK: bool, G: MatchGate>(
         &mut self,
         price_limit: Option<Price>,
         quantity: u64,
-    ) -> u64 {
+        gate: &mut G,
+    ) -> (u64, bool) {
         let mut remaining = quantity;
+        let mut stopped = false;
         let mut freed_chain_head: Option<SlabIndex> = None;
         let mut freed_chain_tail: Option<SlabIndex> = None;
 
@@ -182,6 +185,50 @@ impl<C: FillConsumer> OrderBook<C> {
                     let next_idx = slot.next;
 
                     let fill_qty = remaining.min(resting_qty); // cmov
+
+                    // Gate verdict. `OpenGate` returns `Fill` and both
+                    // arms below fold away.
+                    match gate.admit(
+                        MakerRef {
+                            handle: resting_handle,
+                            price: fill_price,
+                            resting: resting_qty,
+                        },
+                        fill_qty,
+                    ) {
+                        Admit::Fill => {}
+                        Admit::CancelMaker => {
+                            // Whole-order removal with no fill: same slab
+                            // bookkeeping as a full consume.
+                            slab.bump_generation(current_idx);
+                            consumed_qty += resting_qty;
+                            consumed_count += 1;
+                            level_last_freed = current_idx;
+                            match next_idx {
+                                Some(n) => {
+                                    current_idx = n;
+                                    continue;
+                                }
+                                None => {
+                                    level.head = None;
+                                    level.tail = None;
+                                    level.quantity = 0;
+                                    level.order_count = 0;
+                                    break true;
+                                }
+                            }
+                        }
+                        Admit::StopTaker => {
+                            // `current_idx` stays as the head, untouched.
+                            stopped = true;
+                            slab.slots[current_idx.as_usize()].prev = None;
+                            level.head = Some(current_idx);
+                            level.quantity -= consumed_qty;
+                            level.order_count -= consumed_count;
+                            break false;
+                        }
+                    }
+
                     remaining -= fill_qty;
                     self.consumer.on_fill(Fill {
                         resting_id: resting_handle,
@@ -279,6 +326,10 @@ impl<C: FillConsumer> OrderBook<C> {
                 //    drained level is the best.
                 opposite.update_best_price();
             }
+
+            if stopped {
+                break;
+            }
         }
 
         // 6) Splice the sweep's freed chain into the opposite slab's
@@ -291,7 +342,7 @@ impl<C: FillConsumer> OrderBook<C> {
             opposite.slab.free_head = Some(head);
         }
 
-        remaining
+        (remaining, stopped)
     }
 
     // (1) Match against the opposite side up to `price`
@@ -305,12 +356,26 @@ impl<C: FillConsumer> OrderBook<C> {
         price: Price,
         quantity: u64,
     ) -> BookResult<Option<OrderHandle>> {
+        self.add_limit_order_gated(side, price, quantity, &mut OpenGate)
+            .map(|outcome| outcome.handle)
+    }
+
+    /// `add_limit_order` with a per-fill veto. A stopped aggressor does
+    /// not rest its remainder.
+    #[inline(always)]
+    pub fn add_limit_order_gated<G: MatchGate>(
+        &mut self,
+        side: Side,
+        price: Price,
+        quantity: u64,
+        gate: &mut G,
+    ) -> BookResult<GatedOutcome> {
         // Limit semantics: stop matching when price no longer crosses.
         // Dispatch once on aggressor side and select the matcher
         // monomorph that has the opposite side baked in.
-        let remaining = match side {
-            Side::Bid => self.match_against::<true>(Some(price), quantity),
-            Side::Ask => self.match_against::<false>(Some(price), quantity),
+        let (remaining, stopped) = match side {
+            Side::Bid => self.match_against::<true, G>(Some(price), quantity, gate),
+            Side::Ask => self.match_against::<false, G>(Some(price), quantity, gate),
         };
 
         // Dispatch on side at the call site so each arm operates on a
@@ -325,7 +390,7 @@ impl<C: FillConsumer> OrderBook<C> {
         // SIMD registers because `own` and the precomputed side-bit had
         // to be kept alive across the whole function. This shape keeps
         // dispatch at the leaves where the optimiser can see through.
-        let handle = if remaining > 0 {
+        let handle = if remaining > 0 && !stopped {
             match side {
                 Side::Bid => {
                     let (order_idx, generation) = self.bids.alloc_and_rest(price, remaining)?;
@@ -341,7 +406,11 @@ impl<C: FillConsumer> OrderBook<C> {
         };
 
         self.consumer.flush();
-        Ok(handle)
+        Ok(GatedOutcome {
+            handle,
+            remaining,
+            stopped,
+        })
     }
 
     // (1) Decode handle → (side, idx, generation); reject stale handles
@@ -381,6 +450,20 @@ impl<C: FillConsumer> OrderBook<C> {
         quantity: u64,
         mode: MarketOrderMode,
     ) -> BookResult<MarketOrderResult> {
+        self.add_market_order_gated(side, quantity, mode, &mut OpenGate)
+            .map(|(result, _stopped)| result)
+    }
+
+    /// `add_market_order` with a per-fill veto. Returns whether the gate
+    /// stopped the aggressor.
+    #[inline(always)]
+    pub fn add_market_order_gated<G: MatchGate>(
+        &mut self,
+        side: Side,
+        quantity: u64,
+        mode: MarketOrderMode,
+        gate: &mut G,
+    ) -> BookResult<(MarketOrderResult, bool)> {
         // NOTE: Considering the frquency of this happenening, it
         // seems like a big price to pay to run this upfront. I think the
         // best is to actually let it fail iteratively as it tries to fill
@@ -408,21 +491,24 @@ impl<C: FillConsumer> OrderBook<C> {
 
             if available < quantity {
                 // Insufficient liquidity — cancel entire order, zero fills.
-                return Ok(MarketOrderResult {
-                    remaining: quantity,
-                });
+                return Ok((
+                    MarketOrderResult {
+                        remaining: quantity,
+                    },
+                    false,
+                ));
             }
         }
 
         // Market = sweep unconditionally → price_limit = None.
         // Same per-side dispatch pattern as add_limit_order.
-        let remaining = match side {
-            Side::Bid => self.match_against::<true>(None, quantity),
-            Side::Ask => self.match_against::<false>(None, quantity),
+        let (remaining, stopped) = match side {
+            Side::Bid => self.match_against::<true, G>(None, quantity, gate),
+            Side::Ask => self.match_against::<false, G>(None, quantity, gate),
         };
 
         self.consumer.flush();
-        Ok(MarketOrderResult { remaining })
+        Ok((MarketOrderResult { remaining }, stopped))
     }
 }
 
