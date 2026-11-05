@@ -1,5 +1,23 @@
 # calvera-books — Changelog
 
+## v0.2.0 — per-fill `MatchGate`
+
+**Change.** The matcher asks a `MatchGate` before each fill. `add_limit_order`
+and `add_market_order` pass `OpenGate`, which admits every fill.
+
+- **`MatchGate::admit`** sees the resting order (`MakerRef`: handle, price,
+  quantity) and the prospective fill size. It returns `Admit::Fill`,
+  `Admit::CancelMaker`, or `Admit::StopTaker`.
+- **`CancelMaker`** removes the whole resting order with no fill and the sweep
+  continues. **`StopTaker`** ends the sweep. A stopped limit order does not
+  rest its remainder.
+- **`add_limit_order_gated`** returns `GatedOutcome` (`handle`, `remaining`,
+  `stopped`). **`add_market_order_gated`** returns `(MarketOrderResult, stopped)`.
+- **`OpenGate`** admits every fill. The ungated entry points delegate to the
+  gated ones.
+
+---
+
 ## v0.1.1 — `match_against` returns `u64`
 
 **Change.** The sweep no longer returns a `Result`, and a drained level always
