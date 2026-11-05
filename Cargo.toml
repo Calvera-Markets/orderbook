@@ -18,7 +18,7 @@ rand = { version = "0.9", features = ["std", "std_rng", "small_rng"] }
 rand_chacha = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-calvera = { git = "https://github.com/kaizu-xyz/calvera.git", branch = "main" }
+calvera = { git = "https://github.com/Calvera-Markets/disruptor.git", branch = "main" }
 # MBO tapes. Default features include zstd (needed for `.dbn.zst`).
 dbn = "0.66"
 

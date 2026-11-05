@@ -47,7 +47,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "calvera"
 version = "0.1.0"
-source = "git+https://github.com/kaizu-xyz/calvera.git?branch=main#9597972c6e0ac2c9f0641dedf093c7d65029ac8d"
+source = "git+https://github.com/Calvera-Markets/disruptor.git?branch=main#9597972c6e0ac2c9f0641dedf093c7d65029ac8d"
 dependencies = [
  "core_affinity",
  "crossbeam-utils",
